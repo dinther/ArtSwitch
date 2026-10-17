@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+
+# Belong to the tapbox project, not ArtSwitch
+case/
+component_images/
