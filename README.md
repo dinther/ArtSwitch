@@ -138,6 +138,7 @@ The **Relays** card has **ON / OFF** buttons per relay. Incoming Art-Net overrid
 
 **Status**
 - *Last Art-Net* / *Packets received* — data for this board's universe and channels.
+- *ArtPoll (discovery)* — how many discovery requests arrived from controllers such as MadMapper, and from where.
 - *MAC* — the board's Ethernet MAC address.
 - *Art-Net seen (any universe)* — every source and universe that reaches the board, matching or not. **First place to look when a relay doesn't respond**: it tells you whether data arrives at all, and on which universe.
 
@@ -162,7 +163,7 @@ You can also type your own fallback address in the *Fallback IP* field (leave it
 ### Finding a board
 
 - **By name:** `http://<name>.local`.
-- **Art-Net tools:** MadMapper, QLC+ and DMX-Workshop list each board with its name and current IP.
+- **Art-Net tools:** QLC+, DMX-Workshop and MadMapper (with *Use Unicast* and *Auto Poll for devices* on) list each board with its current IP.
 - **Your router:** the DHCP client list shows the board's name and IP.
 - **The label:** the 169.254 fallback address never changes for a board.
 
@@ -176,9 +177,12 @@ Give every board its own name (enforced — see first-time setup) and, usually, 
 
 ## Using it with MadMapper
 
-1. Add a DMX fixture on the universe and channel(s) set on the board.
-2. Make sure the fixture is **switched on** in MadMapper — a disabled fixture sends nothing.
-3. Check the board's web page: *Art-Net seen* should show your PC's IP and the universe.
+1. **Preferences → Project → DMX**: set *DMX Output Device* to **ArtNet** and *Interface* to the network adapter the boards are on.
+2. Add a DMX fixture on the universe and channel(s) set on the board.
+3. Make sure the fixture is **switched on** in MadMapper — a disabled fixture sends nothing.
+4. Check the board's web page: *Art-Net seen* should show your PC's IP and the universe.
+
+**Broadcast or unicast.** With *Use Unicast* off (the default), MadMapper broadcasts every universe to the whole network and each board picks out its own — no device list needed. With **Use Unicast** on and **Auto Poll for devices** ticked, MadMapper discovers the boards and lists them with IP, status, name and universe; it then sends each universe only to the boards that use it, which keeps a busy network quieter. The board's *ArtPoll (discovery)* line on the Status card shows whether MadMapper's discovery requests arrive.
 
 ---
 

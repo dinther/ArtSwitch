@@ -131,6 +131,8 @@ uint32_t lastDhcpProbeAt = 0;
 uint32_t lastDmxAt = 0;
 uint32_t dmxPackets = 0;
 uint32_t pollReplies = 0;
+uint32_t lastPollFrom = 0;  // shown on the web page to check controller discovery
+uint32_t lastPollAt = 0;
 
 // Recently seen Art-Net DMX sources, any universe - shown on the web page for troubleshooting
 struct TrafficSeen {
@@ -478,6 +480,8 @@ void handleArtnet() {
   uint16_t op = packet[8] | (packet[9] << 8);
 
   if (op == OP_POLL) {
+    lastPollFrom = udp.remoteIP();
+    lastPollAt = millis();
     sendPollReply(udp.remoteIP());
   } else if (op == OP_DMX && len >= 18) {
     uint16_t portAddress = packet[14] | ((packet[15] & 0x7F) << 8);
@@ -549,6 +553,7 @@ mixed up with other boards on the network.</p>
 <div class="card"><h2>Status</h2><table>
 <tr><td>Last Art-Net</td><td id="age">-</td></tr>
 <tr><td>Packets received</td><td id="packets">-</td></tr>
+<tr><td>ArtPoll (discovery)</td><td id="polls">-</td></tr>
 <tr><td>MAC</td><td id="mac">-</td></tr>
 <tr><td colspan="2"><b>Art-Net seen (any universe)</b></td></tr>
 <tbody id="traffic"><tr><td>none yet</td><td></td></tr></tbody>
@@ -618,7 +623,8 @@ relays.innerHTML=s.relays.map((r,i)=>'<div class="relay"><div><b>Relay '+(i+1)+'
 (r.wait?'<br><small>'+(r.want?'ON':'OFF')+' in '+(r.wait/1000).toFixed(1)+' s</small>':'')+'</span>'+
 (r.pin<0?'':'<button class="sm" onclick="test('+(i+1)+',\'on\')">ON</button><button class="sm off" onclick="test('+(i+1)+',\'off\')">OFF</button>')+'</div>').join('');
 age.textContent=s.age<0?'never':(s.age/1000).toFixed(1)+' s ago';
-packets.textContent=s.packets;hip.textContent=s.ip;hmode.textContent=s.fallback?'fallback':'DHCP';
+packets.textContent=s.packets;hip.textContent=s.ip;
+polls.textContent=s.polls?s.polls+'×, last from '+s.pollFrom+' '+(s.pollAge/1000).toFixed(0)+' s ago':'none yet';hmode.textContent=s.fallback?'fallback':'DHCP';
 huni.textContent='Universe '+s.universe;hdmx.textContent='DMX '+s.base+'–'+(s.base+s.relays.length-1);mac.textContent=s.mac;
 if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; universe '+t.u+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('');
 }catch(e){}}
@@ -689,8 +695,10 @@ String renderStatus() {
                   (unsigned long)lockoutRemainingMs(i), relays[i].value, c.onAt, c.offAt, c.minSwitchMs);
   }
   n += snprintf(json + n, sizeof(json) - n,
-                "],\"universe\":%u,\"base\":%u,\"age\":%ld,\"packets\":%lu,\"ip\":\"%s\",\"fallback\":%s,\"mac\":\"%s\",\"traffic\":[",
-                settings.universe, settings.baseChannel,
+                "],\"universe\":%u,\"base\":%u,\"polls\":%lu,\"pollFrom\":\"%s\",\"pollAge\":%lu,"
+                "\"age\":%ld,\"packets\":%lu,\"ip\":\"%s\",\"fallback\":%s,\"mac\":\"%s\",\"traffic\":[",
+                settings.universe, settings.baseChannel, (unsigned long)pollReplies,
+                IPAddress(lastPollFrom).toString().c_str(), (unsigned long)(millis() - lastPollAt),
                 dmxPackets == 0 ? -1L : (long)(millis() - lastDmxAt), (unsigned long)dmxPackets,
                 ETH.localIP().toString().c_str(), usingFallback ? "true" : "false", ETH.macAddress().c_str());
   uint32_t now = millis();
