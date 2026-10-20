@@ -515,8 +515,17 @@ h1{font-size:1.4em;margin:0 0 12px}h2{font-size:1.05em;margin:0 0 10px}
 table{width:100%;border-collapse:collapse}td{padding:4px 0}td:last-child{text-align:right;font-family:monospace}
 label{display:block;margin:10px 0 4px;font-size:.9em}input,select{width:100%;padding:8px;box-sizing:border-box;font-size:1em}
 small{color:#71717a}button{padding:10px 16px;font-size:1em;border:0;border-radius:6px;background:#2563eb;color:#fff;margin:8px 8px 0 0}
-button.off{background:#52525b}button.sm{padding:6px 10px;font-size:.85em;margin:0 0 0 6px}.on{color:#16a34a;font-weight:bold}
+button.off{background:#52525b}
 .relay{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e4e4e7}
+.sw{position:relative;display:inline-block;flex:none;width:52px;height:30px;margin:0 0 0 12px;cursor:pointer}
+.sw input{position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;opacity:0;cursor:pointer;z-index:1}
+.sw span{position:absolute;inset:0;border-radius:15px;background:#d4d4d8;transition:background .2s}
+.sw span::after{content:'';position:absolute;left:3px;top:3px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0005;transition:transform .2s}
+.sw input:checked+span{background:#16a34a}.sw input:checked+span::after{transform:translateX(22px)}
+.sw input:focus-visible+span{outline:2px solid #2563eb;outline-offset:2px}
+.relay.wait .sw span{background:#fcd34d}
+#offline{display:none;background:#fee2e2;color:#991b1b;border-radius:6px;padding:10px;margin-bottom:16px;font-size:.9em}
+body.offline #offline{display:block}body.offline #relays{opacity:.5}
 .relay:last-of-type{border-bottom:0}fieldset{border:1px solid #e4e4e7;border-radius:8px;margin:12px 0 0;padding:4px 12px 12px}
 legend{font-weight:bold;font-size:.9em;padding:0 4px}
 .dual{position:relative;height:32px;margin-top:4px}
@@ -533,7 +542,7 @@ dialog::backdrop{background:#0006}dialog h2{margin-top:0}.err{color:#b91c1c;font
 .top .lbl{font-size:.75em;letter-spacing:.08em;text-transform:uppercase;opacity:.7}
 .top .nm{font-size:1.8em;font-weight:bold;line-height:1.2;word-break:break-all}
 .top .ad{font-family:monospace;font-size:1.15em;margin-top:4px}.top .ad small{color:#bfdbfe}
-.top .lo{font-family:monospace;font-size:.9em;color:#bfdbfe}.warn button{margin:8px 0 0}.warn{background:#fef3c7;color:#92400e;border-radius:6px;padding:10px;font-size:.9em}.relay .st{font-family:monospace;margin-left:auto;margin-right:4px}
+.top .lo{font-family:monospace;font-size:.9em;color:#bfdbfe}.warn button{margin:8px 0 0}.warn{background:#fef3c7;color:#92400e;border-radius:6px;padding:10px;font-size:.9em}.relay .st{font-family:monospace;font-size:.85em;text-align:right;margin-left:auto}
 </style></head><body>
 <header class="top"><div class="lbl">ArtSwitch</div><div class="nm">%RUNNINGNAME%</div>
 <div class="ad"><span id="hip">%IP%</span> <small id="hmode">%IPMODE%</small></div>
@@ -548,8 +557,9 @@ mixed up with other boards on the network.</p>
 <div class="err" id="nameErr"></div>
 <button type="button" onclick="saveName()">Save &amp; restart</button><button type="button" class="off" onclick="nameDlg.close()">Later</button>
 </form></dialog>
+<div id="offline">No answer from the board, retrying&hellip; The values below may be out of date.</div>
 <div class="card"><h2>Relays</h2><div id="relays"></div>
-<small>Incoming Art-Net overrides the test buttons.</small></div>
+<small>Incoming Art-Net overrides the switches. Amber: the switch waits for the minimum switch time.</small></div>
 <div class="card"><h2>Status</h2><table>
 <tr><td>Last Art-Net</td><td id="age">-</td></tr>
 <tr><td>Packets received</td><td id="packets">-</td></tr>
@@ -578,7 +588,12 @@ still takes over; after that the address is held until the cable is re-plugged. 
 <br><button type="submit">Save</button><button type="button" class="off" onclick="restart()">Restart</button>
 </form></div>
 <script>
-function test(n,s){fetch('/relay?n='+n+'&state='+s)}
+// Status is polled one request at a time, so an old answer can never overwrite a newer one.
+// gen changes around every switch click; a poll started before that is stale and not shown.
+let gen=0,polling=false,again=false,timer=0,rowsKey='';
+async function toggle(n,on){gen++;
+try{await fetch('/relay?n='+n+'&state='+(on?'on':'off'),{cache:'no-store'})}catch(e){}
+gen++;poll()}
 // Two-handle threshold slider: grey = off zone, amber = dead zone (relay keeps its state), green = on zone.
 // The handles can't cross; dragging one into the other pushes it along so off stays below on.
 document.querySelectorAll('.dual').forEach(d=>{const lo=d.querySelector('.lo'),hi=d.querySelector('.hi'),
@@ -616,19 +631,30 @@ await new Promise(t=>setTimeout(t,1000))}
 document.body.innerHTML+='<div class="card">Board did not come back within a minute. Try <a href="'+target+'">'+target+'</a> or its IP address.</div>'}
 if(new URLSearchParams(location.search).has('saved')){history.replaceState(null,'','/');
 if(savedName!==runningName&&confirm('Name changed to '+savedName+'. Restart now to move to http://'+savedName+'.local?'))restart(false)}
-async function poll(){try{const s=await (await fetch('/status')).json();
-relays.innerHTML=s.relays.map((r,i)=>'<div class="relay"><div><b>Relay '+(i+1)+'</b><br><small>'+(r.pin<0?'no pin':r.pinName)+', ch '+r.ch+
-' &middot; on &ge;'+r.onAt+' / off &le;'+r.offAt+(r.min?' &middot; min '+(r.min/1000)+' s':'')+'</small></div>'+
-'<span class="st'+(r.on?' on':'')+'">'+(r.pin<0?'--':(r.on?'ON':'OFF'))+(r.value<0?'':' ('+r.value+')')+
-(r.wait?'<br><small>'+(r.want?'ON':'OFF')+' in '+(r.wait/1000).toFixed(1)+' s</small>':'')+'</span>'+
-(r.pin<0?'':'<button class="sm" onclick="test('+(i+1)+',\'on\')">ON</button><button class="sm off" onclick="test('+(i+1)+',\'off\')">OFF</button>')+'</div>').join('');
+// Rows are only rebuilt when a pin is assigned or freed; otherwise they are updated in place,
+// so a click never lands on an element that is being replaced
+function showRelays(s){const key=s.relays.map(r=>r.pin<0).join();
+if(key!==rowsKey){rowsKey=key;relays.innerHTML=s.relays.map((r,i)=>'<div class="relay"><div><b>Relay '+(i+1)+
+'</b><br><small class="info"></small></div><span class="st"></span>'+(r.pin<0?'':'<label class="sw"><input type="checkbox" role="switch" aria-label="Relay '+
+(i+1)+'" onchange="toggle('+(i+1)+',this.checked)"><span></span></label>')+'</div>').join('')}
+s.relays.forEach((r,i)=>{const row=relays.children[i],sw=row.querySelector('input');
+row.querySelector('.info').innerHTML=(r.pin<0?'no pin':r.pinName)+', ch '+r.ch+' &middot; on &ge;'+r.onAt+' / off &le;'+r.offAt+
+(r.min?' &middot; min '+(r.min/1000)+' s':'');
+row.querySelector('.st').innerHTML=r.pin<0?'not used':(r.value<0?'':'DMX '+r.value)+
+(r.wait?'<br>'+(r.want?'on':'off')+' in '+(r.wait/1000).toFixed(1)+' s':'');
+row.classList.toggle('wait',r.wait>0);if(sw)sw.checked=r.want})}
+async function poll(){if(polling){again=true;return}polling=true;again=false;clearTimeout(timer);const g=gen;
+try{const res=await fetch('/status',{cache:'no-store',signal:AbortSignal.timeout(3000)});if(!res.ok)throw 0;
+const s=await res.json();document.body.classList.remove('offline');if(g===gen)show(s)}
+catch(e){document.body.classList.add('offline')}
+polling=false;timer=setTimeout(poll,again?0:1000)}
+function show(s){showRelays(s);
 age.textContent=s.age<0?'never':(s.age/1000).toFixed(1)+' s ago';
 packets.textContent=s.packets;hip.textContent=s.ip;
 polls.textContent=s.polls?s.polls+'×, last from '+s.pollFrom+' '+(s.pollAge/1000).toFixed(0)+' s ago':'none yet';hmode.textContent=s.fallback?'fallback':'DHCP';
 huni.textContent='Universe '+s.universe;hdmx.textContent='DMX '+s.base+'–'+(s.base+s.relays.length-1);mac.textContent=s.mac;
-if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; universe '+t.u+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('');
-}catch(e){}}
-poll();setInterval(poll,1000);
+if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; universe '+t.u+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('')}
+poll();
 </script></body></html>)html";
 
 String renderRelaySettings() {
@@ -766,7 +792,9 @@ void handleSave(AsyncWebServerRequest *request) {
 void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", renderPage()); });
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "application/json", renderStatus());
+    AsyncWebServerResponse *res = r->beginResponse(200, "application/json", renderStatus());
+    res->addHeader("Cache-Control", "no-store");
+    r->send(res);
   });
   server.on("/save", HTTP_POST, handleSave);
   // Name only, from the naming pop-up; everything else stays as it is
