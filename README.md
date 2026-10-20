@@ -7,6 +7,7 @@ Art-Net controlled relay switch on a **WT32-ETH01** (ESP32 + Ethernet) board. Up
 - DHCP, with a self-assigned `169.254.x.x` fallback when there is no DHCP server
 - Reachable by name: `http://<name>.local`
 - Shows up in Art-Net tools (MadMapper, QLC+, DMX-Workshop) via ArtPoll
+- WiFi backup while the Ethernet cable is unplugged, with an open setup hotspot as last resort
 - Firmware updates over Ethernet
 
 Tested on WT32-ETH01 **V1.4** boards with MadMapper as the Art-Net source.
@@ -39,7 +40,7 @@ The dead zone stops a relay from chattering when a fader sits near a switch poin
 | 0 / 1 | On as soon as the fader leaves zero |
 | 254 / 255 | On only at full |
 
-**Minimum switch time** (per relay, 0–60 s, default 0 = no limit): after a relay switches, it won't switch again until this time has passed. A change asked for in the meantime is carried out when the time is up — if the DMX value still asks for it. A chase or strobe flashing the channel can't then hammer the relay or the load (motors, compressors, transformers, some LED drivers). The relay card shows a countdown ("OFF in 1.4 s") while a switch is held back. The first switch after power-up is never delayed. The test buttons obey the minimum time too.
+**Minimum switch time** (per relay, 0–60 s, default 0 = no limit): after a relay switches, it won't switch again until this time has passed. A change asked for in the meantime is carried out when the time is up — if the DMX value still asks for it. A chase or strobe flashing the channel can't then hammer the relay or the load (motors, compressors, transformers, some LED drivers). The relay card shows a countdown ("off in 1.4 s") and an amber switch while a switch is held back. The first switch after power-up is never delayed. The switches on the web page obey the minimum time too.
 
 - **Relay 1** listens on the base address, **relay 2** on base + 1, **relay 3** on base + 2.
 - At power-up all relays are **off**.
@@ -126,23 +127,24 @@ Universe, base address, pins, switch points and minimum switch time take effect 
 
 ### 5. Test
 
-The **Relays** card has **ON / OFF** buttons per relay. Incoming Art-Net overrides them straight away — to test by hand, stop your controller's output first.
+The **Relays** card has a slide switch per relay (green = on). Incoming Art-Net overrides it straight away — to test by hand, stop your controller's output first.
 
 ---
 
 ## The web page
 
-**Header** — the board's name, IP address (DHCP or fallback), Art-Net universe and DMX channels, and its `http://<name>.local` address. Updates live, e.g. right after you save a new universe. The browser tab is titled with the board's name too.
+**Header** — the board's name, IP address and how it is connected (Ethernet, Ethernet with fallback IP, WiFi, hotspot), Art-Net universe and DMX channels, and its `http://<name>.local` address. Updates live, e.g. right after you save a new universe. The browser tab is titled with the board's name too.
 
-**Relays** — state of each relay, its pin, channel, switch points and minimum switch time, the last DMX value received, a countdown when a switch is being held back, and test buttons.
+**Relays** — state of each relay, its pin, channel, switch points and minimum switch time, the last DMX value received, a countdown when a switch is being held back, and a switch to test it by hand.
 
 **Status**
 - *Last Art-Net* / *Packets received* — data for this board's universe and channels.
 - *ArtPoll (discovery)* — how many discovery requests arrived from controllers such as MadMapper, and from where.
-- *MAC* — the board's Ethernet MAC address.
+- *WiFi* — standby, joining, joined (with signal strength) or hotspot. See [WiFi backup](#wifi-backup).
+- *MAC* — the board's MAC address, used on Ethernet and on WiFi.
 - *Art-Net seen (any universe)* — every source and universe that reaches the board, matching or not. **First place to look when a relay doesn't respond**: it tells you whether data arrives at all, and on which universe.
 
-**Settings** — name, universe, base address, per relay its pin, switch points and minimum switch time, and the fallback IP. **Restart** applies name and fallback IP changes; after a restart the page follows the board to its (new) address.
+**Settings** — name, universe, base address, per relay its pin, switch points and minimum switch time, the fallback IP and the backup WiFi network. **Restart** applies name and fallback IP changes; after a restart the page follows the board to its (new) address.
 
 ---
 
@@ -160,14 +162,32 @@ The 169.254 address is derived from the board's MAC address: **the same every bo
 
 You can also type your own fallback address in the *Fallback IP* field (leave it empty for automatic). The netmask follows from the address: `2.x` / `10.x` → 255.0.0.0, `169.254.x` → 255.255.0.0, `192.168.x` → 255.255.255.0. Takes effect after restart.
 
+### WiFi backup
+
+The board normally runs on Ethernet only; its WiFi is off. When the **Ethernet cable is unplugged** for more than 5 seconds (or the board starts without one):
+
+1. It joins the **backup WiFi network** set on the web page.
+2. If that network can't be joined within 30 seconds — or none is set — it opens an **open hotspot** named after the board (e.g. `stage-left`). Connect a phone or laptop to it and open `http://<name>` (the board answers every name on its hotspot) or **http://192.168.4.1**. Some phones also offer **Sign in to network**, which opens the settings page. If the phone also has mobile data on, it may send names to the mobile network instead — use the IP address then. While nobody is connected to the hotspot, the board keeps trying to join the backup network every 30 seconds.
+3. As soon as the cable is back, WiFi switches off and the board is on Ethernet again.
+
+Only one connection is active at a time, so a controller never sees the board twice. Things to know:
+
+- On WiFi the board uses its **Ethernet MAC address**, so your router gives it the **same IP address** as on the cable, and an address reservation in the router covers both. Network switches take a moment to notice the address moved. (On the hotspot, or when the cable had no DHCP server, the address does differ.)
+- Art-Net over WiFi works, but WiFi is less dependable than a cable — treat it as a backup, not for the show.
+- The hotspot has **no password**: anyone nearby can open the settings page while it is up.
+- WiFi draws noticeably more current than Ethernet. A weak 5 V supply that copes on Ethernet can make the board restart once WiFi switches on.
+
+Set the network under *Backup WiFi network* in Settings; **Scan** lists the networks the board can see (strongest first) and fills in the one you tap. A scan takes a few seconds; on Ethernet the WiFi radio is switched on just for that time. An empty password field keeps the saved password; to remove WiFi, clear the network name. Changes apply immediately.
+
 ### Finding a board
 
 - **By name:** `http://<name>.local`.
 - **Art-Net tools:** QLC+, DMX-Workshop and MadMapper (with *Use Unicast* and *Auto Poll for devices* on) list each board with its current IP.
 - **Your router:** the DHCP client list shows the board's name and IP.
 - **The label:** the 169.254 fallback address never changes for a board.
+- **No cable, no WiFi:** join the board's hotspot and open http://192.168.4.1.
 
-Older Android phones can't open `.local` names; use the IP address there.
+Android phones (at least up to Android 12) often can't open `.local` names. Try **`http://<name>`** without `.local` (type the `http://`): many home routers answer it with the name the board gave when it got its address, and it follows the board when it switches between Ethernet and WiFi. Otherwise use the IP address.
 
 ### Several boards
 
@@ -231,7 +251,7 @@ At 115200 baud the board prints its IP address at boot and a line each time a re
 
 ## Security
 
-ArtSwitch is meant for closed show and lighting networks. There is **no login on the web page and no password on network firmware updates**: anyone who can reach the board on the network can switch the relays, change settings or flash new firmware. Don't connect it to an untrusted network, and keep it away from the internet.
+ArtSwitch is meant for closed show and lighting networks. There is **no login on the web page, no password on network firmware updates, and the backup hotspot is open**: anyone who can reach the board on the network can switch the relays, change settings or flash new firmware. Don't connect it to an untrusted network, and keep it away from the internet.
 
 ---
 
@@ -253,6 +273,9 @@ The board still has the default name `artswitch`. Give it a name in the pop-up.
 
 **IP address changed a minute or two after power-up**
 The board had taken its 169.254 fallback address and then a DHCP server answered within the 2-minute window. See [DHCP and the 169.254 fallback](#dhcp-and-the-169254-fallback).
+
+**Board restarts or drops off the network when the Ethernet cable is unplugged**
+Its WiFi has switched on and the 5 V supply can't deliver the extra current. Use a stronger supply.
 
 **Relay clicked at power-up**
 Probably on IO5, IO14 or IO15, which can pulse at boot. Move it to IO4, IO32 or IO33.

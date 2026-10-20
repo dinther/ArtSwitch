@@ -9,15 +9,22 @@
 //   web page (active-high, off at boot)
 // - Relays hold their last state when Art-Net stops
 // - Firmware updates over Ethernet (ArduinoOTA, see platformio.ini env:ota)
+// - WiFi as a backup: joins the WiFi network set on the web page while the Ethernet cable is
+//   unplugged, and opens an open hotspot named after the board when that network can't be
+//   reached (or none is set). WiFi is switched off as soon as the cable is back.
 
 #include <Arduino.h>
 #include <ETH.h>
+#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <esp_mac.h>
+#include <esp_wifi.h>
+#include <esp_netif.h>
 
 // Every board starts with this name; saving or restarting is refused until it is changed,
 // so two boards on one network don't both answer to artswitch.local
@@ -32,6 +39,15 @@ static const uint32_t DHCP_TIMEOUT_MS = 10000;
 static const uint32_t DHCP_PROBE_INTERVAL_MS = 15000;
 // Once someone may have configured against the fallback address, it must not move mid-show
 static const uint32_t DHCP_GRACE_MS = 120000;
+// WiFi waits this long without an Ethernet link, so a link coming up at boot or a cable being
+// re-seated doesn't start WiFi
+static const uint32_t WIFI_START_DELAY_MS = 5000;
+static const uint32_t WIFI_JOIN_TIMEOUT_MS = 30000;  // then open the hotspot
+static const uint32_t WIFI_RETRY_MS = 10000;         // between join attempts
+// While the hotspot is up, joining is retried only when nobody is connected to it: a join
+// attempt scans all channels and would drop the phone using the hotspot
+static const uint32_t HOTSPOT_RETRY_MS = 30000;
+static const uint32_t SCAN_TIMEOUT_MS = 15000;
 
 // Default hysteresis around the 50% point so a fader parked mid-way doesn't chatter a relay
 static const uint8_t DEFAULT_ON_AT = 140;
@@ -89,6 +105,8 @@ struct Settings {
   uint16_t baseChannel;       // relay n listens on baseChannel + n
   RelayConfig relay[RELAY_COUNT];
   IPAddress fallbackIp;       // used when DHCP fails; 0.0.0.0 = automatic 169.254.x.x
+  String wifiSsid;            // backup WiFi network, empty = hotspot only
+  String wifiPass;            // empty = open network
 };
 
 struct Relay {
@@ -115,6 +133,7 @@ volatile int8_t pendingTest[RELAY_COUNT] = {-1, -1, -1};  // -1 none, 0 off, 1 o
 volatile bool linkUp = false;
 volatile bool gotIp = false;
 uint32_t linkUpAt = 0;
+volatile uint32_t linkDownAt = 0;  // boot counts as link down
 bool usingFallback = false;
 bool networkServicesStarted = false;
 String runningName;  // hostname mDNS was started with; a saved new name applies after restart
@@ -127,6 +146,23 @@ bool dhcpProbing = false;
 uint32_t dhcpProbeXid = 0;
 uint32_t fallbackSince = 0;
 uint32_t lastDhcpProbeAt = 0;
+
+enum WifiState { WIFI_STANDBY, WIFI_JOINING, WIFI_JOINED, WIFI_HOTSPOT };
+volatile WifiState wifiState = WIFI_STANDBY;
+volatile bool wifiGotIp = false;
+uint32_t wifiStateAt = 0;
+uint32_t lastJoinAt = 0;
+// On the hotspot there is no router to resolve names, so the board answers every name with its
+// own address: http://<name> works, and a phone's internet check lands on the settings page
+DNSServer hotspotDns;
+
+// WiFi network scan for the settings page. The web handler only asks; loop() runs the scan and
+// fills scanResults (JSON) before setting SCAN_DONE, so the handler never reads it half-written.
+enum ScanState { SCAN_IDLE, SCAN_REQUESTED, SCAN_RUNNING, SCAN_DONE, SCAN_FAILED };
+volatile ScanState scanState = SCAN_IDLE;
+String scanResults;
+bool scanRadioOnly = false;
+uint32_t scanStartedAt = 0;  // radio switched on just for the scan, off again afterwards
 
 uint32_t lastDmxAt = 0;
 uint32_t dmxPackets = 0;
@@ -178,6 +214,28 @@ String sanitizeName(const String &in) {
   return out.length() ? out : String(DEFAULT_NAME);
 }
 
+// WiFi network names can contain any character
+String htmlEscape(const String &in) {
+  String out;
+  for (char c : in) {
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
+String jsonEscape(const String &in) {
+  String out;
+  for (char c : in) {
+    if (c == '"' || c == '\\') out += '\\';
+    if ((uint8_t)c >= 0x20) out += c;
+  }
+  return out;
+}
+
 // Link-local address from the MAC, so several boards without DHCP don't collide and a PC
 // that self-assigned 169.254.x.x is on the same subnet. 169.254.0.x and .255.x are reserved.
 IPAddress autoFallbackIp() {
@@ -220,6 +278,8 @@ void loadSettings() {
     c.minSwitchMs = min(prefs.getUShort(key, 0), MAX_MIN_SWITCH_MS);
   }
   settings.fallbackIp = IPAddress(prefs.getUInt("fallback", 0));
+  settings.wifiSsid = prefs.getString("wssid", "");
+  settings.wifiPass = prefs.getString("wpass", "");
   prefs.end();
 }
 
@@ -241,6 +301,8 @@ void saveSettings() {
     prefs.putUShort(key, c.minSwitchMs);
   }
   prefs.putUInt("fallback", (uint32_t)settings.fallbackIp);
+  prefs.putString("wssid", settings.wifiSsid);
+  prefs.putString("wpass", settings.wifiPass);
   prefs.end();
 }
 
@@ -328,6 +390,14 @@ void onNetworkEvent(WiFiEvent_t event) {
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("Ethernet link down");
       linkUp = false;
+      linkDownAt = millis();
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("WiFi IP address: %s\n", WiFi.localIP().toString().c_str());
+      wifiGotIp = true;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      wifiGotIp = false;
       break;
     default:
       break;
@@ -408,8 +478,198 @@ void probeForDhcpServer() {
   }
 }
 
+// ---------------------------------------------------------------- WiFi backup
+
+void setWifiState(WifiState s) {
+  wifiState = s;
+  wifiStateAt = millis();
+}
+
+void joinWifi() {
+  lastJoinAt = millis();
+  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPass.c_str());
+}
+
+// WiFi joins with the Ethernet MAC, so the router sees the same device and hands out the same
+// address (and name) as on the cable. Only one of the two is ever active, so the MAC never
+// appears twice on the network. Set on the driver and on the IP interface, which keeps its own
+// copy for DHCP and ARP.
+void useEthernetMacForWifi() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_ETH);
+  esp_wifi_set_mac(WIFI_IF_STA, mac);
+  esp_netif_set_mac(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), mac);
+}
+
+void startHotspot() {
+  // Keep the station side when a network is set, so joining can be retried from the hotspot
+  WiFi.mode(settings.wifiSsid.length() ? WIFI_AP_STA : WIFI_AP);
+  if (settings.wifiSsid.length()) useEthernetMacForWifi();
+  WiFi.softAP(runningName.c_str());
+  hotspotDns.start(53, "*", WiFi.softAPIP());
+  lastJoinAt = millis();
+  setWifiState(WIFI_HOTSPOT);
+  Serial.printf("WiFi hotspot \"%s\" open, http://%s\n", runningName.c_str(),
+                WiFi.softAPIP().toString().c_str());
+}
+
+void startWifi() {
+  WiFi.setHostname(runningName.c_str());
+  WiFi.setAutoReconnect(false);  // retries are paced by updateWifi()
+  if (!settings.wifiSsid.length()) {
+    startHotspot();
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  useEthernetMacForWifi();
+  joinWifi();
+  setWifiState(WIFI_JOINING);
+  Serial.printf("No Ethernet link, joining WiFi \"%s\"\n", settings.wifiSsid.c_str());
+}
+
+void stopWifi() {
+  if (wifiState == WIFI_STANDBY) return;
+  hotspotDns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiGotIp = false;
+  setWifiState(WIFI_STANDBY);
+  Serial.println("WiFi off");
+}
+
+// WiFi only runs while the Ethernet link is down, so the board is never on the network twice
+void updateWifi() {
+  if (linkUp) {
+    stopWifi();
+    return;
+  }
+  if (scanRadioOnly) return;  // let the scan finish before WiFi takes over the radio
+  // The fallback-address DHCP probe belongs to Ethernet; a re-plugged cable retries DHCP anyway
+  if (dhcpProbing) {
+    dhcpProbe.stop();
+    dhcpProbing = false;
+  }
+  uint32_t now = millis();
+  switch (wifiState) {
+    case WIFI_STANDBY:
+      if (now - linkDownAt >= WIFI_START_DELAY_MS) startWifi();
+      break;
+    case WIFI_JOINING:
+      if (wifiGotIp) {
+        setWifiState(WIFI_JOINED);
+        Serial.printf("Joined WiFi \"%s\"\n", settings.wifiSsid.c_str());
+      } else if (now - wifiStateAt >= WIFI_JOIN_TIMEOUT_MS) {
+        startHotspot();
+      } else if (now - lastJoinAt >= WIFI_RETRY_MS) {
+        joinWifi();
+      }
+      break;
+    case WIFI_JOINED:
+      if (!wifiGotIp) {
+        Serial.println("WiFi connection lost");
+        joinWifi();
+        setWifiState(WIFI_JOINING);
+      }
+      break;
+    case WIFI_HOTSPOT:
+      if (wifiGotIp) {
+        hotspotDns.stop();
+        WiFi.softAPdisconnect(true);
+        setWifiState(WIFI_JOINED);
+        Serial.printf("Joined WiFi \"%s\", hotspot closed\n", settings.wifiSsid.c_str());
+      } else if (settings.wifiSsid.length() && WiFi.softAPgetStationNum() == 0 &&
+                 now - lastJoinAt >= HOTSPOT_RETRY_MS) {
+        joinWifi();
+      } else {
+        hotspotDns.processNextRequest();
+      }
+      break;
+  }
+}
+
+void updateScan() {
+  if (scanState == SCAN_REQUESTED) {
+    if (wifiState == WIFI_JOINING) return;  // can't scan during a join attempt; wait for it
+    if (wifiState == WIFI_STANDBY) {
+      WiFi.mode(WIFI_STA);
+      scanRadioOnly = true;
+    }
+    scanStartedAt = millis();
+    scanState = WiFi.scanNetworks(true) == WIFI_SCAN_FAILED ? SCAN_FAILED : SCAN_RUNNING;
+    if (scanState == SCAN_RUNNING) return;
+  } else if (scanState == SCAN_RUNNING) {
+    // Some scans take longer than the 6 s after which WiFi.scanComplete() gives up (seen on the
+    // board: done in 3 s or in over 6 s), so wait for the scan-done flag with our own limit
+    bool done = WiFiGenericClass::getStatusBits() & WIFI_SCAN_DONE_BIT;
+    if (!done && millis() - scanStartedAt < SCAN_TIMEOUT_MS) return;
+    int n = done ? WiFi.scanComplete() : WIFI_SCAN_FAILED;
+    // One entry per network name (strongest access point), strongest first, at most 20
+    struct Net {
+      String ssid;
+      int rssi;
+      bool locked;
+    };
+    std::vector<Net> nets;
+    for (int i = 0; i < n; i++) {
+      String ssid = WiFi.SSID(i);
+      if (!ssid.length()) continue;  // hidden network
+      bool seen = false;
+      for (Net &net : nets) {
+        if (net.ssid != ssid) continue;
+        net.rssi = max(net.rssi, (int)WiFi.RSSI(i));
+        seen = true;
+      }
+      if (!seen) nets.push_back({ssid, WiFi.RSSI(i), WiFi.encryptionType(i) != WIFI_AUTH_OPEN});
+    }
+    std::sort(nets.begin(), nets.end(), [](const Net &a, const Net &b) { return a.rssi > b.rssi; });
+    String json = "[";
+    for (size_t i = 0; i < nets.size() && i < 20; i++) {
+      json += String(i ? "," : "") + "{\"s\":\"" + jsonEscape(nets[i].ssid) + "\",\"r\":" + nets[i].rssi +
+              ",\"l\":" + (nets[i].locked ? "true" : "false") + "}";
+    }
+    scanResults = json + "]";
+    WiFi.scanDelete();
+    scanState = n < 0 ? SCAN_FAILED : SCAN_DONE;
+  } else {
+    return;
+  }
+  if (scanRadioOnly) {
+    scanRadioOnly = false;
+    if (wifiState == WIFI_STANDBY) WiFi.mode(WIFI_OFF);
+  }
+}
+
+// Address and interface the board is reachable on right now
+bool onWifi() { return !linkUp && wifiState != WIFI_STANDBY; }
+
+IPAddress currentIp() {
+  if (!onWifi()) return ETH.localIP();
+  if (wifiState == WIFI_HOTSPOT) return WiFi.softAPIP();
+  return WiFi.localIP();
+}
+
+String netModeText() {
+  if (!linkUp && wifiState == WIFI_STANDBY) return "no cable";
+  if (!onWifi()) return usingFallback ? "Ethernet, fallback IP" : "Ethernet";
+  if (wifiState == WIFI_HOTSPOT) return "hotspot";
+  if (wifiState == WIFI_JOINED) return "WiFi";
+  return "joining WiFi";
+}
+
+String wifiText() {
+  const String &ssid = settings.wifiSsid;
+  switch (wifiState) {
+    case WIFI_JOINING: return "joining " + ssid + "...";
+    case WIFI_JOINED: return ssid + " (" + String(WiFi.RSSI()) + " dBm)";
+    case WIFI_HOTSPOT:
+      return "hotspot " + runningName + ", " + String(WiFi.softAPgetStationNum()) + " connected";
+    default: return ssid.length() ? "standby, backup: " + ssid : "standby, backup: hotspot";
+  }
+}
+
 void startNetworkServicesOnce() {
-  if (networkServicesStarted || !gotIp) return;
+  if (networkServicesStarted || !(gotIp || wifiGotIp || wifiState == WIFI_HOTSPOT)) return;
   networkServicesStarted = true;
   if (MDNS.begin(settings.name.c_str())) MDNS.addService("http", "tcp", 80);
   ArduinoOTA.setHostname(settings.name.c_str());
@@ -418,16 +678,16 @@ void startNetworkServicesOnce() {
   ArduinoOTA.onEnd([]() { Serial.println("OTA update done, restarting"); });
   ArduinoOTA.begin();
   Serial.printf("Web interface: http://%s.local  or  http://%s\n",
-                settings.name.c_str(), ETH.localIP().toString().c_str());
+                settings.name.c_str(), currentIp().toString().c_str());
 }
 
 // ---------------------------------------------------------------- Art-Net
 
 void sendPollReply(IPAddress to) {
   uint8_t r[239] = {0};
-  IPAddress ip = ETH.localIP();
+  IPAddress ip = currentIp();
   uint8_t mac[6];
-  ETH.macAddress(mac);
+  ETH.macAddress(mac);  // WiFi uses the same MAC
   bool anyData = false;
   for (const Relay &relay : relays) anyData |= relay.value >= 0;
 
@@ -460,7 +720,8 @@ void sendPollReply(IPAddress to) {
   for (int i = 0; i < 4; i++) r[207 + i] = ip[i];
   r[211] = 1;                               // BindIndex
   // Status2: web config, DHCP capable, 15-bit port-address, currently DHCP?
-  r[212] = 0x01 | 0x04 | 0x08 | (usingFallback ? 0x00 : 0x02);
+  bool dhcp = onWifi() ? wifiState != WIFI_HOTSPOT : !usingFallback;
+  r[212] = 0x01 | 0x04 | 0x08 | (dhcp ? 0x02 : 0x00);
 
   udp.beginPacket(to, ARTNET_PORT);
   udp.write(r, sizeof(r));
@@ -538,6 +799,10 @@ legend{font-weight:bold;font-size:.9em;padding:0 4px}
 dialog{border:0;border-radius:12px;padding:20px;width:calc(100% - 32px);max-width:380px;box-shadow:0 10px 40px #0004}
 dialog::backdrop{background:#0006}dialog h2{margin-top:0}.err{color:#b91c1c;font-size:.9em;min-height:1.2em}
 .url{font-family:monospace;color:#2563eb;word-break:break-all}
+.row{display:flex;gap:8px}.row button{margin:0;flex:none}
+.nets{border:1px solid #e4e4e7;border-radius:8px;margin-top:6px;max-height:260px;overflow:auto}.nets:empty{display:none}
+.nets div{display:flex;justify-content:space-between;gap:8px;padding:9px 10px;border-bottom:1px solid #f4f4f5}
+.nets div.pick{cursor:pointer}.nets div.pick:hover{background:#eff6ff}.nets div:last-child{border-bottom:0}
 .top{background:#1e3a8a;color:#fff;border-radius:10px;padding:14px 16px;margin-bottom:16px}
 .top .lbl{font-size:.75em;letter-spacing:.08em;text-transform:uppercase;opacity:.7}
 .top .nm{font-size:1.8em;font-weight:bold;line-height:1.2;word-break:break-all}
@@ -564,6 +829,7 @@ mixed up with other boards on the network.</p>
 <tr><td>Last Art-Net</td><td id="age">-</td></tr>
 <tr><td>Packets received</td><td id="packets">-</td></tr>
 <tr><td>ArtPoll (discovery)</td><td id="polls">-</td></tr>
+<tr><td>WiFi</td><td id="wifi">-</td></tr>
 <tr><td>MAC</td><td id="mac">-</td></tr>
 <tr><td colspan="2"><b>Art-Net seen (any universe)</b></td></tr>
 <tbody id="traffic"><tr><td>none yet</td><td></td></tr></tbody>
@@ -585,6 +851,13 @@ a switch until that long after the previous one, protecting relays and loads fro
 <small>Leave empty for automatic (%AUTOFALLBACK%, netmask 255.255.0.0, unique per board).
 Used when no DHCP server answers within 10 s. A DHCP server appearing in the next 2 minutes
 still takes over; after that the address is held until the cable is re-plugged. Applied after restart.</small>
+<label>Backup WiFi network</label><div class="row"><input name="wifissid" value="%WIFISSID%" maxlength="32" placeholder="none: hotspot only" autocomplete="off">
+<button type="button" id="scanBtn" onclick="scan()">Scan</button></div><div class="nets" id="nets"></div>
+<label>WiFi password</label><input name="wifipass" type="password" maxlength="63" placeholder="%WIFIPASSHINT%" autocomplete="new-password">
+<small>Used only while the Ethernet cable is unplugged: the board joins this network (with its Ethernet
+MAC, so the router gives it the same IP) and goes back to Ethernet when the cable returns. If the network can't be joined within 30 s,
+or none is set, the board opens an open WiFi hotspot named "%RUNNINGNAME%"; connect to it and open
+http://192.168.4.1. Leave the password empty to keep the saved one. Applied immediately.</small>
 <br><button type="submit">Save</button><button type="button" class="off" onclick="restart()">Restart</button>
 </form></div>
 <script>
@@ -605,6 +878,19 @@ const p=a/255*100,q=b/255*100;
 trk.style.background='linear-gradient(to right,#a1a1aa '+p+'%,#f59e0b '+p+'%,#f59e0b '+q+'%,#16a34a '+q+'%)';
 lab.querySelector('.vo').textContent=pct(a);lab.querySelector('.vn').textContent=pct(b)}
 lo.addEventListener('input',upd);hi.addEventListener('input',upd);upd()});
+// WiFi scan: start it, then ask until the list is ready (it waits for a join attempt in progress)
+const getJson=async u=>(await fetch(u,{cache:'no-store'})).json();
+async function scan(){scanBtn.disabled=true;scanBtn.textContent='Scanning…';nets.innerHTML='';
+try{let s=await getJson('/scan?start=1');
+for(let i=0;s.state==='scanning'&&i<60;i++){await new Promise(t=>setTimeout(t,700));s=await getJson('/scan')}
+if(s.state!=='done')throw 0;
+if(!s.nets.length)nets.innerHTML='<div>No networks found</div>';
+s.nets.forEach(n=>{const d=document.createElement('div');d.className='pick';
+d.innerHTML='<span></span><small>'+n.r+' dBm &middot; '+(n.l?'password':'open')+'</small>';d.firstChild.textContent=n.s;
+d.onclick=()=>{settingsForm.wifissid.value=n.s;settingsForm.wifipass.value='';nets.innerHTML='';if(n.l)settingsForm.wifipass.focus()};
+nets.appendChild(d)})}
+catch(e){nets.innerHTML='<div>Scan failed, try again.</div>'}
+scanBtn.disabled=false;scanBtn.textContent='Scan'}
 let savedName='%NAME%';const runningName='%RUNNINGNAME%',defaultName='%DEFAULTNAME%';
 // Same cleanup as the board does: lowercase, letters/digits/'-', no '-' at the ends
 const cleanName=s=>s.toLowerCase().replace(/[^a-z0-9-]/g,'').replace(/^-+|-+$/g,'').slice(0,31);
@@ -651,8 +937,9 @@ polling=false;timer=setTimeout(poll,again?0:1000)}
 function show(s){showRelays(s);
 age.textContent=s.age<0?'never':(s.age/1000).toFixed(1)+' s ago';
 packets.textContent=s.packets;hip.textContent=s.ip;
-polls.textContent=s.polls?s.polls+'×, last from '+s.pollFrom+' '+(s.pollAge/1000).toFixed(0)+' s ago':'none yet';hmode.textContent=s.fallback?'fallback':'DHCP';
+polls.textContent=s.polls?s.polls+'×, last from '+s.pollFrom+' '+(s.pollAge/1000).toFixed(0)+' s ago':'none yet';hmode.textContent=s.net;
 huni.textContent='Universe '+s.universe;hdmx.textContent='DMX '+s.base+'–'+(s.base+s.relays.length-1);mac.textContent=s.mac;
+wifi.textContent=s.wifi;
 if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; universe '+t.u+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('')}
 poll();
 </script></body></html>)html";
@@ -699,20 +986,25 @@ String renderPage() {
                                       : String());
   page.replace("%RUNNINGNAME%", runningName);
   page.replace("%DEFAULTNAME%", DEFAULT_NAME);
-  page.replace("%IP%", ETH.localIP().toString());
+  page.replace("%IP%", currentIp().toString());
   page.replace("%DMXRANGE%", String(settings.baseChannel) + "&ndash;" + String(settings.baseChannel + RELAY_COUNT - 1));
-  page.replace("%IPMODE%", usingFallback ? "fallback" : "DHCP");
+  page.replace("%IPMODE%", netModeText());
   page.replace("%NAME%", settings.name);
+  page.replace("%WIFIPASSHINT%", settings.wifiPass.length() ? "saved, leave empty to keep" : "none (open network)");
+  page.replace("%WIFISSID%", htmlEscape(settings.wifiSsid));  // last: an SSID may contain anything
   page.replace("%FALLBACK%", (uint32_t)settings.fallbackIp ? settings.fallbackIp.toString() : String());
   page.replace("%AUTOFALLBACK%", autoFallbackIp().toString());
   return page;
 }
 
 String renderStatus() {
-  char json[1600];
+  char json[2048];
   size_t n = snprintf(json, sizeof(json), "{\"relays\":[");
+  // Keeps n inside the buffer if a long WiFi name ever fills it, so the output is cut, not overrun
+  auto clamp = [&]() { n = min(n, sizeof(json) - 1); };
   for (int i = 0; i < RELAY_COUNT; i++) {
     const RelayConfig &c = settings.relay[i];
+    clamp();
     n += snprintf(json + n, sizeof(json) - n,
                   "%s{\"pin\":%d,\"pinName\":\"%s\",\"ch\":%u,\"on\":%s,\"want\":%s,\"wait\":%lu,"
                   "\"value\":%d,\"onAt\":%u,\"offAt\":%u,\"min\":%u}",
@@ -720,19 +1012,24 @@ String renderStatus() {
                   relays[i].on ? "true" : "false", relays[i].want ? "true" : "false",
                   (unsigned long)lockoutRemainingMs(i), relays[i].value, c.onAt, c.offAt, c.minSwitchMs);
   }
+  clamp();
   n += snprintf(json + n, sizeof(json) - n,
                 "],\"universe\":%u,\"base\":%u,\"polls\":%lu,\"pollFrom\":\"%s\",\"pollAge\":%lu,"
-                "\"age\":%ld,\"packets\":%lu,\"ip\":\"%s\",\"fallback\":%s,\"mac\":\"%s\",\"traffic\":[",
+                "\"age\":%ld,\"packets\":%lu,\"ip\":\"%s\",\"net\":\"%s\",\"mac\":\"%s\",\"wifi\":\"%s\","
+                "\"traffic\":[",
                 settings.universe, settings.baseChannel, (unsigned long)pollReplies,
                 IPAddress(lastPollFrom).toString().c_str(), (unsigned long)(millis() - lastPollAt),
                 dmxPackets == 0 ? -1L : (long)(millis() - lastDmxAt), (unsigned long)dmxPackets,
-                ETH.localIP().toString().c_str(), usingFallback ? "true" : "false", ETH.macAddress().c_str());
+                currentIp().toString().c_str(), netModeText().c_str(), ETH.macAddress().c_str(),
+                jsonEscape(wifiText()).c_str());
   uint32_t now = millis();
   for (int i = 0; i < trafficCount; i++) {
+    clamp();
     n += snprintf(json + n, sizeof(json) - n, "%s{\"ip\":\"%s\",\"u\":%u,\"age\":%lu}", i ? "," : "",
                   IPAddress(traffic[i].ip).toString().c_str(), traffic[i].universe,
                   (unsigned long)(now - traffic[i].lastAt));
   }
+  clamp();
   snprintf(json + n, sizeof(json) - n, "]}");
   return String(json);
 }
@@ -746,6 +1043,12 @@ void handleSave(AsyncWebServerRequest *request) {
   long channel = arg("channel").toInt();
   IPAddress fallback;
   String name = sanitizeName(arg("name"));
+  String wifiSsid = arg("wifissid");
+  wifiSsid.trim();
+  String wifiPass = arg("wifipass");
+  // An empty password field keeps the saved password, unless the network changes
+  if (!wifiPass.length() && wifiSsid == settings.wifiSsid) wifiPass = settings.wifiPass;
+  if (!wifiSsid.length()) wifiPass = "";
   String error;
   if (settingsPending) error = "Previous save still being applied, try again.";
   else if (name == DEFAULT_NAME) error = "Give this board its own name first, not \"artswitch\".";
@@ -753,6 +1056,9 @@ void handleSave(AsyncWebServerRequest *request) {
   else if (channel < 1 || channel > 512 - RELAY_COUNT + 1) error = "Base address must be 1-510.";
   else if (arg("fallback").length() && !fallback.fromString(arg("fallback")))
     error = "Fallback IP is not a valid address.";
+  else if (wifiSsid.length() > 32) error = "WiFi network name is longer than 32 characters.";
+  else if (wifiPass.length() && (wifiPass.length() < 8 || wifiPass.length() > 63))
+    error = "WiFi password must be 8-63 characters, or empty for an open network.";
 
   RelayConfig relayConfig[RELAY_COUNT];
   for (int i = 0; i < RELAY_COUNT && !error.length(); i++) {
@@ -785,6 +1091,8 @@ void handleSave(AsyncWebServerRequest *request) {
   memcpy(pendingSettings.relay, relayConfig, sizeof(relayConfig));
   pendingSettings.name = name;
   pendingSettings.fallbackIp = fallback;
+  pendingSettings.wifiSsid = wifiSsid;
+  pendingSettings.wifiPass = wifiPass;
   settingsPending = true;
   request->redirect("/?saved=1");
 }
@@ -825,6 +1133,17 @@ void setupWebServer() {
     pendingTest[i] = state->value() == "on" ? 1 : 0;
     r->send(200, "text/plain", "OK");
   });
+  // /scan?start=1 starts a WiFi scan; /scan reports "scanning" until the list is ready
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (r->hasParam("start") && scanState != SCAN_REQUESTED && scanState != SCAN_RUNNING)
+      scanState = SCAN_REQUESTED;
+    String json = scanState == SCAN_DONE     ? "{\"state\":\"done\",\"nets\":" + scanResults + "}"
+                  : scanState == SCAN_FAILED ? String("{\"state\":\"failed\"}")
+                                             : String("{\"state\":\"scanning\"}");
+    AsyncWebServerResponse *res = r->beginResponse(200, "application/json", json);
+    res->addHeader("Cache-Control", "no-store");
+    r->send(res);
+  });
   server.on("/restart", HTTP_GET, [](AsyncWebServerRequest *r) {
     if (settings.name == DEFAULT_NAME) {
       r->send(400, "text/plain", "Give this board its own name and save before restarting.");
@@ -833,14 +1152,24 @@ void setupWebServer() {
     r->send(200, "text/plain", "Restarting");
     restartRequested = true;
   });
-  server.onNotFound([](AsyncWebServerRequest *r) { r->send(404, "text/plain", "Not found"); });
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    // On the hotspot, phones probe a known page to check for internet; sending them to the
+    // settings page makes them offer "Sign in to network", which opens it
+    if (wifiState == WIFI_HOTSPOT) {
+      r->redirect("http://" + WiFi.softAPIP().toString() + "/");
+      return;
+    }
+    r->send(404, "text/plain", "Not found");
+  });
   server.begin();
 }
 
 void applyPendingSettings() {
   if (!settingsPending) return;
+  bool wifiChanged = settings.wifiSsid != pendingSettings.wifiSsid || settings.wifiPass != pendingSettings.wifiPass;
   settings = pendingSettings;
   saveSettings();
+  if (wifiChanged) stopWifi();  // updateWifi() starts it again with the new network if still needed
   for (int i = 0; i < RELAY_COUNT; i++) {
     assignRelayPin(i, settings.relay[i].pin);
     relays[i].value = -1;
@@ -869,6 +1198,7 @@ void setup() {
                 settings.name.c_str());
 
   WiFi.onEvent(onNetworkEvent);
+  WiFi.persistent(false);  // the network is kept in our own settings; don't rewrite WiFi's flash copy
   ETH.begin();  // pins and PHY come from the wt32-eth01 board variant
 
   udp.begin(ARTNET_PORT);
@@ -880,6 +1210,8 @@ void loop() {
   checkDhcpFallback();
   if (dhcpRestartRequested) restartDhcp();
   probeForDhcpServer();
+  updateWifi();
+  updateScan();
   startNetworkServicesOnce();
   handleArtnet();
   applyPendingSettings();
