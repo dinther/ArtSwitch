@@ -21,6 +21,7 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <lwip/sockets.h>
 #include <Preferences.h>
 #include <esp_mac.h>
 #include <esp_wifi.h>
@@ -35,6 +36,13 @@ static const int8_t NO_PIN = -1;
 // verified on the board). It mirrors relay 1's output for testing.
 static const int RELAY1_LED_PIN = 17;
 static const uint16_t ARTNET_PORT = 6454;
+static const uint16_t SACN_PORT = 5568;
+static const uint16_t SACN_MAX_UNIVERSE = 63999;
+// A source that sends nothing for this long is gone (E1.31 network data loss timeout)
+static const uint32_t SACN_SOURCE_TIMEOUT_MS = 2500;
+
+enum Protocol : uint8_t { PROTO_ARTNET, PROTO_SACN, PROTO_BOTH };
+const char *const PROTOCOL_NAMES[] = {"Art-Net", "sACN", "Art-Net and sACN"};
 static const uint32_t DHCP_TIMEOUT_MS = 10000;
 static const uint32_t DHCP_PROBE_INTERVAL_MS = 15000;
 // Once someone may have configured against the fallback address, it must not move mid-show
@@ -101,12 +109,18 @@ struct RelayConfig {
 
 struct Settings {
   String name;                // mDNS hostname and Art-Net short name
+  uint8_t protocol;           // Protocol: which of Art-Net / sACN switch the relays
   uint16_t universe;          // 15-bit Art-Net port-address (Net:SubNet:Universe)
+  uint16_t sacnUniverse;      // sACN universe, 1-63999
   uint16_t baseChannel;       // relay n listens on baseChannel + n
   RelayConfig relay[RELAY_COUNT];
   IPAddress fallbackIp;       // used when DHCP fails; 0.0.0.0 = automatic 169.254.x.x
   String wifiSsid;            // backup WiFi network, empty = hotspot only
   String wifiPass;            // empty = open network
+  bool oscEnabled;
+  uint16_t oscPort;
+  IPAddress oscFeedbackIp;    // relay changes are sent here; 0.0.0.0 = no feedback
+  uint16_t oscFeedbackPort;
 };
 
 struct Relay {
@@ -122,6 +136,9 @@ Settings settings;
 Relay relays[RELAY_COUNT];
 Preferences prefs;
 WiFiUDP udp;
+int sacnSocket = -1;  // plain socket: WiFiUDP can join only one multicast group
+WiFiUDP oscUdp;
+uint16_t oscOpenPort = 0;  // port oscUdp listens on, 0 = closed
 AsyncWebServer server(80);
 
 // Web handlers run in the async TCP task; they hand changes to loop() through these
@@ -170,19 +187,29 @@ uint32_t pollReplies = 0;
 uint32_t lastPollFrom = 0;  // shown on the web page to check controller discovery
 uint32_t lastPollAt = 0;
 
-// Recently seen Art-Net DMX sources, any universe - shown on the web page for troubleshooting
+// Recently seen Art-Net and sACN DMX sources, any universe - shown on the web page for troubleshooting
 struct TrafficSeen {
   uint32_t ip;
   uint16_t universe;
+  bool sacn;
+  char name[33];              // sACN source name (Art-Net DMX packets carry none)
+  uint8_t priority;           // sACN priority
   uint32_t lastAt;
 };
 TrafficSeen traffic[8];
 int trafficCount = 0;
 
-void noteTraffic(IPAddress ip, uint16_t universe) {
+// sACN source names are up to 64 bytes and not always terminated; 32 characters is plenty here
+void copySacnName(char *to, const uint8_t *from) {
+  int n = 0;
+  while (n < 32 && from[n]) to[n] = from[n], n++;
+  to[n] = 0;
+}
+
+void noteTraffic(IPAddress ip, uint16_t universe, bool sacn, const uint8_t *name = nullptr, uint8_t priority = 0) {
   int slot = -1;
   for (int i = 0; i < trafficCount; i++)
-    if (traffic[i].ip == (uint32_t)ip && traffic[i].universe == universe) slot = i;
+    if (traffic[i].ip == (uint32_t)ip && traffic[i].universe == universe && traffic[i].sacn == sacn) slot = i;
   if (slot < 0) {
     if (trafficCount < 8) {
       slot = trafficCount++;
@@ -193,11 +220,42 @@ void noteTraffic(IPAddress ip, uint16_t universe) {
     }
     traffic[slot].ip = ip;
     traffic[slot].universe = universe;
+    traffic[slot].sacn = sacn;
   }
+  if (name) copySacnName(traffic[slot].name, name);
+  else traffic[slot].name[0] = 0;
+  traffic[slot].priority = priority;
   traffic[slot].lastAt = millis();
 }
 
-uint8_t packet[600];
+// sACN Universe Discovery (E1.31 section 8): sources announce the universes they send every
+// 10 s. Shown on the web page to help find which universe a controller uses.
+static const uint16_t SACN_DISCOVERY_UNIVERSE = 64214;
+static const uint32_t SACN_ANNOUNCE_TIMEOUT_MS = 30000;
+struct SacnAnnounce {
+  uint8_t cid[16];
+  uint32_t ip;
+  char name[33];
+  uint16_t universes[16];     // the first 16 announced
+  uint16_t count;             // all announced, may be more than 16
+  uint32_t lastAt;
+};
+SacnAnnounce announces[4];
+int announceCount = 0;
+
+// sACN sources sending to our universe; the highest priority one is followed
+struct SacnSource {
+  uint8_t cid[16];
+  uint8_t priority;
+  uint8_t sequence;
+  uint32_t lastAt;
+};
+SacnSource sacnSources[4];
+int sacnSourceCount = 0;
+// Universe and interfaces the sACN socket joined; rejoined when any of them changes
+String sacnJoinedKey;
+
+uint8_t packet[640];  // largest: sACN with 512 slots, 638 bytes
 
 // ---------------------------------------------------------------- settings
 
@@ -258,7 +316,9 @@ IPAddress netmaskFor(IPAddress ip) {
 void loadSettings() {
   prefs.begin("artswitch", true);
   settings.name = prefs.getString("name", DEFAULT_NAME);
+  settings.protocol = min((int)prefs.getUChar("proto", PROTO_ARTNET), (int)PROTO_BOTH);
   settings.universe = prefs.getUShort("universe", 0);
+  settings.sacnUniverse = constrain(prefs.getUShort("sacnuni", 1), 1, SACN_MAX_UNIVERSE);
   settings.baseChannel = prefs.getUShort("channel", 1);
   for (int i = 0; i < RELAY_COUNT; i++) {
     RelayConfig &c = settings.relay[i];
@@ -280,13 +340,19 @@ void loadSettings() {
   settings.fallbackIp = IPAddress(prefs.getUInt("fallback", 0));
   settings.wifiSsid = prefs.getString("wssid", "");
   settings.wifiPass = prefs.getString("wpass", "");
+  settings.oscEnabled = prefs.getBool("osc", false);
+  settings.oscPort = prefs.getUShort("oscport", 8000);
+  settings.oscFeedbackIp = IPAddress(prefs.getUInt("oscfbip", 0));
+  settings.oscFeedbackPort = prefs.getUShort("oscfbport", 9000);
   prefs.end();
 }
 
 void saveSettings() {
   prefs.begin("artswitch", false);
   prefs.putString("name", settings.name);
+  prefs.putUChar("proto", settings.protocol);
   prefs.putUShort("universe", settings.universe);
+  prefs.putUShort("sacnuni", settings.sacnUniverse);
   prefs.putUShort("channel", settings.baseChannel);
   for (int i = 0; i < RELAY_COUNT; i++) {
     const RelayConfig &c = settings.relay[i];
@@ -303,10 +369,16 @@ void saveSettings() {
   prefs.putUInt("fallback", (uint32_t)settings.fallbackIp);
   prefs.putString("wssid", settings.wifiSsid);
   prefs.putString("wpass", settings.wifiPass);
+  prefs.putBool("osc", settings.oscEnabled);
+  prefs.putUShort("oscport", settings.oscPort);
+  prefs.putUInt("oscfbip", (uint32_t)settings.oscFeedbackIp);
+  prefs.putUShort("oscfbport", settings.oscFeedbackPort);
   prefs.end();
 }
 
 // ---------------------------------------------------------------- relays
+
+void sendOscFeedback(int i);
 
 // Bring the output to the wanted state, but not sooner than minSwitchMs after the previous
 // switch. A change asked for during the lockout is carried out when it ends, if still wanted.
@@ -319,6 +391,7 @@ void updateRelay(int i) {
   r.lastSwitchAt = millis();
   if (r.pin != NO_PIN) digitalWrite(r.pin, r.on ? HIGH : LOW);
   Serial.printf("Relay %d %s\n", i + 1, r.on ? "ON" : "OFF");
+  sendOscFeedback(i);
 }
 
 void requestRelay(int i, bool on) {
@@ -358,6 +431,21 @@ void applyDmxValue(int i, uint8_t value) {
   relays[i].value = value;
   if (!relays[i].want && value >= c.onAt) requestRelay(i, true);
   else if (relays[i].want && value <= c.offAt) requestRelay(i, false);
+}
+
+// DMX slots from Art-Net or sACN for our universe; slot 0 is channel 1
+void applyDmxFrame(const uint8_t *dmx, int count) {
+  bool used = false;
+  for (int i = 0; i < RELAY_COUNT; i++) {
+    int index = settings.baseChannel + i - 1;
+    if (index >= count) continue;
+    applyDmxValue(i, dmx[index]);
+    used = true;
+  }
+  if (used) {
+    dmxPackets++;
+    lastDmxAt = millis();
+  }
 }
 
 void applyPendingTests() {
@@ -740,28 +828,253 @@ void handleArtnet() {
 
   uint16_t op = packet[8] | (packet[9] << 8);
 
+  bool artnetOn = settings.protocol != PROTO_SACN;
   if (op == OP_POLL) {
+    // On sACN only, stay out of Art-Net discovery so no controller sends Art-Net that would be ignored
+    if (!artnetOn) return;
     lastPollFrom = udp.remoteIP();
     lastPollAt = millis();
     sendPollReply(udp.remoteIP());
   } else if (op == OP_DMX && len >= 18) {
     uint16_t portAddress = packet[14] | ((packet[15] & 0x7F) << 8);
-    noteTraffic(udp.remoteIP(), portAddress);
-    if (portAddress != settings.universe) return;
+    noteTraffic(udp.remoteIP(), portAddress, false);
+    if (!artnetOn || portAddress != settings.universe) return;
     uint16_t dmxLength = (packet[16] << 8) | packet[17];
-    bool used = false;
-    for (int i = 0; i < RELAY_COUNT; i++) {
-      uint16_t channel = settings.baseChannel + i;
-      int index = 18 + channel - 1;
-      if (channel > dmxLength || index >= len) continue;
-      applyDmxValue(i, packet[index]);
-      used = true;
-    }
-    if (used) {
-      dmxPackets++;
-      lastDmxAt = millis();
-    }
+    applyDmxFrame(&packet[18], min((int)dmxLength, len - 18));
   }
+}
+
+// ---------------------------------------------------------------- sACN (E1.31)
+
+IPAddress sacnMulticastIp(uint16_t universe) { return IPAddress(239, 255, universe >> 8, universe & 0xFF); }
+
+// Listen on the sACN port and join the universe's multicast group. A group is joined on the
+// interfaces that are up at that moment, so this runs again whenever Ethernet or WiFi comes up.
+void updateSacnSocket() {
+  char key[24] = "";
+  if (settings.protocol != PROTO_ARTNET && (gotIp || wifiGotIp || wifiState == WIFI_HOTSPOT))
+    snprintf(key, sizeof(key), "%u/%d%d%d%d", settings.sacnUniverse, linkUp, gotIp, (int)wifiState, wifiGotIp);
+  if (sacnJoinedKey == key) return;
+  sacnJoinedKey = key;
+  if (sacnSocket >= 0) close(sacnSocket);
+  sacnSocket = -1;
+  sacnSourceCount = 0;
+  if (!key[0]) return;
+  sacnSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(SACN_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (sacnSocket < 0 || bind(sacnSocket, (sockaddr *)&addr, sizeof(addr)) != 0) {
+    Serial.println("sACN: can't open port 5568");
+    if (sacnSocket >= 0) close(sacnSocket);
+    sacnSocket = -1;
+    return;
+  }
+  fcntl(sacnSocket, F_SETFL, O_NONBLOCK);
+  // Our universe and the discovery universe; interface "any" joins on every interface that is up
+  for (uint16_t universe : {settings.sacnUniverse, SACN_DISCOVERY_UNIVERSE}) {
+    ip_mreq group = {};
+    group.imr_multiaddr.s_addr = (uint32_t)sacnMulticastIp(universe);
+    group.imr_interface.s_addr = htonl(INADDR_ANY);
+    setsockopt(sacnSocket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &group, sizeof(group));
+  }
+  Serial.printf("sACN universe %u (%s)\n", settings.sacnUniverse,
+                sacnMulticastIp(settings.sacnUniverse).toString().c_str());
+}
+
+// Universe Discovery packet: framing vector 2, discovery vector 1, then pages of universe numbers
+void noteSacnAnnounce(IPAddress ip, int len) {
+  if (len < 120 || (packet[40] << 24 | packet[41] << 16 | packet[42] << 8 | packet[43]) != 2 ||
+      (packet[114] << 24 | packet[115] << 16 | packet[116] << 8 | packet[117]) != 1)
+    return;
+  int slot = -1;
+  for (int i = 0; i < announceCount; i++)
+    if (memcmp(announces[i].cid, &packet[22], 16) == 0) slot = i;
+  if (slot < 0) {
+    if (announceCount < 4) {
+      slot = announceCount++;
+    } else {  // replace the stalest source
+      slot = 0;
+      for (int i = 1; i < 4; i++)
+        if (announces[i].lastAt < announces[slot].lastAt) slot = i;
+    }
+    memcpy(announces[slot].cid, &packet[22], 16);
+  }
+  SacnAnnounce &a = announces[slot];
+  a.ip = ip;
+  copySacnName(a.name, &packet[44]);
+  if (packet[118] == 0) a.count = 0;  // the first page starts the list again
+  for (int i = 120; i + 1 < len; i += 2) {
+    if (a.count < 16) a.universes[a.count] = packet[i] << 8 | packet[i + 1];
+    a.count++;
+  }
+  a.lastAt = millis();
+}
+
+// Track the source and decide whether to follow this packet: the highest priority source that
+// is still sending wins, packets arriving out of order are dropped (E1.31 section 6.7.2)
+bool acceptSacnSource(const uint8_t *cid, uint8_t priority, uint8_t sequence, bool terminated) {
+  uint32_t now = millis();
+  for (int i = 0; i < sacnSourceCount;) {  // forget sources that stopped sending
+    if (now - sacnSources[i].lastAt > SACN_SOURCE_TIMEOUT_MS) sacnSources[i] = sacnSources[--sacnSourceCount];
+    else i++;
+  }
+  int slot = -1;
+  for (int i = 0; i < sacnSourceCount; i++)
+    if (memcmp(sacnSources[i].cid, cid, 16) == 0) slot = i;
+  if (terminated) {
+    if (slot >= 0) sacnSources[slot] = sacnSources[--sacnSourceCount];
+    return false;
+  }
+  if (slot >= 0) {
+    int8_t diff = sequence - sacnSources[slot].sequence;
+    if (diff <= 0 && diff > -20) return false;
+  } else {
+    if (sacnSourceCount == 4) return false;  // more sources than anyone needs for three relays
+    slot = sacnSourceCount++;
+    memcpy(sacnSources[slot].cid, cid, 16);
+  }
+  sacnSources[slot].priority = priority;
+  sacnSources[slot].sequence = sequence;
+  sacnSources[slot].lastAt = now;
+  for (int i = 0; i < sacnSourceCount; i++)
+    if (sacnSources[i].priority > priority) return false;
+  return true;
+}
+
+void handleSacn() {
+  if (sacnSocket < 0) return;
+  sockaddr_in from;
+  socklen_t fromLen = sizeof(from);
+  int len = recvfrom(sacnSocket, packet, sizeof(packet), 0, (sockaddr *)&from, &fromLen);
+  if (len <= 0) return;
+  IPAddress fromIp(from.sin_addr.s_addr);
+  static const uint8_t ACN_ID[] = {0x41, 0x53, 0x43, 0x2d, 0x45, 0x31, 0x2e, 0x31, 0x37, 0x00, 0x00, 0x00};
+  auto be32 = [](const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; };
+  if (len < 22 || memcmp(&packet[4], ACN_ID, sizeof(ACN_ID)) != 0) return;
+  // Root vector 8 = extended packet: universe discovery (sync packets are ignored)
+  if (be32(&packet[18]) == 8) {
+    noteSacnAnnounce(fromIp, len);
+    return;
+  }
+  // Root vector 4 = data packet, framing vector 2, DMP vector 2 with address/data type 0xa1
+  if (len < 126 || be32(&packet[18]) != 4 || be32(&packet[40]) != 2 || packet[117] != 2 || packet[118] != 0xa1)
+    return;
+  uint16_t universe = packet[113] << 8 | packet[114];
+  noteTraffic(fromIp, universe, true, &packet[44], packet[108]);
+  uint8_t options = packet[112];
+  if (universe != settings.sacnUniverse || (options & 0x80)) return;  // other universe, or preview data
+  if (!acceptSacnSource(&packet[22], packet[108], packet[111], options & 0x40)) return;
+  if (packet[125] != 0) return;  // not DMX (start code)
+  uint16_t slots = (packet[123] << 8 | packet[124]) - 1;
+  applyDmxFrame(&packet[126], min((int)slots, len - 126));
+}
+
+// ---------------------------------------------------------------- OSC
+
+uint32_t oscMessages = 0;
+uint32_t lastOscFrom = 0;
+uint32_t lastOscAt = 0;
+
+// Listen on the OSC port while OSC is on; the socket follows the board across Ethernet and WiFi
+void updateOscSocket() {
+  uint16_t port = settings.oscEnabled ? settings.oscPort : 0;
+  if (port == oscOpenPort) return;
+  oscUdp.stop();
+  if (port) oscUdp.begin(port);
+  oscOpenPort = port;
+}
+
+// OSC strings are null-terminated and padded to a multiple of 4 bytes; returns the offset after it
+int oscSkipString(const uint8_t *p, int at, int len) {
+  while (at < len && p[at]) at++;
+  return (at + 4) & ~3;
+}
+
+// Same switch points as DMX: a 0-1 fader goes through on/off levels with the dead zone between
+void applyOscLevel(int i, int level) {
+  const RelayConfig &c = settings.relay[i];
+  if (!relays[i].want && level >= c.onAt) requestRelay(i, true);
+  else if (relays[i].want && level <= c.offAt) requestRelay(i, false);
+}
+
+// One message: /<name>/relay/<n> or /artswitch/relay/<n> with an int, float, double or true/false
+void handleOscMessage(const uint8_t *p, int len) {
+  int typesAt = oscSkipString(p, 0, len);
+  if (typesAt + 1 >= len || p[typesAt] != ',') return;
+  const char *address = (const char *)p;
+  int n = -1;
+  for (const String &prefix : {"/" + runningName + "/relay/", String("/") + DEFAULT_NAME + "/relay/"}) {
+    if (strncmp(address, prefix.c_str(), prefix.length()) == 0 && strlen(address) == prefix.length() + 1)
+      n = address[prefix.length()] - '1';
+  }
+  if (n < 0 || n >= RELAY_COUNT) return;
+  char type = p[typesAt + 1];
+  int argAt = oscSkipString(p, typesAt, len);
+  auto be32 = [&](int at) { return (uint32_t)p[at] << 24 | p[at + 1] << 16 | p[at + 2] << 8 | p[at + 3]; };
+  int level;
+  if (type == 'T') level = 255;
+  else if (type == 'F') level = 0;
+  else if (type == 'i' && argAt + 4 <= len) level = (int32_t)be32(argAt) ? 255 : 0;
+  else if (type == 'f' && argAt + 4 <= len) {
+    uint32_t bits = be32(argAt);
+    float f;
+    memcpy(&f, &bits, 4);
+    level = lroundf(constrain(f, 0.0f, 1.0f) * 255);
+  } else if (type == 'd' && argAt + 8 <= len) {
+    uint64_t bits = (uint64_t)be32(argAt) << 32 | be32(argAt + 4);
+    double d;
+    memcpy(&d, &bits, 8);
+    level = lround(constrain(d, 0.0, 1.0) * 255);
+  } else {
+    return;
+  }
+  oscMessages++;
+  lastOscAt = millis();
+  applyOscLevel(n, level);
+}
+
+// A bundle holds size-prefixed messages or further bundles; depth keeps a hostile packet from recursing far
+void handleOscPacket(const uint8_t *p, int len, int depth = 0) {
+  if (len >= 16 && memcmp(p, "#bundle", 8) == 0) {
+    if (depth >= 4) return;
+    for (int at = 16; at + 4 <= len;) {  // skip "#bundle" and the 8-byte time tag
+      int size = p[at] << 24 | p[at + 1] << 16 | p[at + 2] << 8 | p[at + 3];
+      at += 4;
+      if (size <= 0 || at + size > len) return;
+      handleOscPacket(p + at, size, depth + 1);
+      at += size;
+    }
+  } else if (len >= 8 && p[0] == '/') {
+    handleOscMessage(p, len);
+  }
+}
+
+void handleOsc() {
+  if (!oscOpenPort) return;
+  int len = oscUdp.parsePacket();
+  if (len <= 0) return;
+  if (len > (int)sizeof(packet)) len = sizeof(packet);
+  len = oscUdp.read(packet, len);
+  oscUdp.flush();
+  lastOscFrom = oscUdp.remoteIP();
+  handleOscPacket(packet, len);
+}
+
+// Every change of a relay output, whatever caused it, goes to the feedback address
+void sendOscFeedback(int i) {
+  if (!oscOpenPort || !(uint32_t)settings.oscFeedbackIp) return;
+  uint8_t msg[64] = {0};
+  int len = snprintf((char *)msg, 48, "/%s/relay/%d", runningName.c_str(), i + 1);
+  len = (len + 4) & ~3;
+  memcpy(&msg[len], ",i", 2);
+  len += 4;
+  msg[len + 3] = relays[i].on ? 1 : 0;
+  len += 4;
+  oscUdp.beginPacket(settings.oscFeedbackIp, settings.oscFeedbackPort);
+  oscUdp.write(msg, len);
+  oscUdp.endPacket();
 }
 
 // ---------------------------------------------------------------- web
@@ -800,6 +1113,7 @@ dialog{border:0;border-radius:12px;padding:20px;width:calc(100% - 32px);max-widt
 dialog::backdrop{background:#0006}dialog h2{margin-top:0}.err{color:#b91c1c;font-size:.9em;min-height:1.2em}
 .url{font-family:monospace;color:#2563eb;word-break:break-all}
 .row{display:flex;gap:8px}.row button{margin:0;flex:none}
+label.chk{display:flex;align-items:center;gap:8px;margin-top:14px}label.chk input{width:auto;margin:0}
 .nets{border:1px solid #e4e4e7;border-radius:8px;margin-top:6px;max-height:260px;overflow:auto}.nets:empty{display:none}
 .nets div{display:flex;justify-content:space-between;gap:8px;padding:9px 10px;border-bottom:1px solid #f4f4f5}
 .nets div.pick{cursor:pointer}.nets div.pick:hover{background:#eff6ff}.nets div:last-child{border-bottom:0}
@@ -811,7 +1125,7 @@ dialog::backdrop{background:#0006}dialog h2{margin-top:0}.err{color:#b91c1c;font
 </style></head><body>
 <header class="top"><div class="lbl">ArtSwitch</div><div class="nm">%RUNNINGNAME%</div>
 <div class="ad"><span id="hip">%IP%</span> <small id="hmode">%IPMODE%</small></div>
-<div class="ad"><span id="huni">Universe %UNIVERSE%</span> <small>&middot;</small> <span id="hdmx">DMX %DMXRANGE%</span></div>
+<div class="ad"><span id="huni">%UNIVERSETEXT%</span> <small>&middot;</small> <span id="hdmx">DMX %DMXRANGE%</span></div>
 <div class="lo">http://%RUNNINGNAME%.local</div></header>
 <dialog id="nameDlg"><form method="dialog" onsubmit="return false">
 <h2>Name this board</h2>
@@ -824,23 +1138,29 @@ mixed up with other boards on the network.</p>
 </form></dialog>
 <div id="offline">No answer from the board, retrying&hellip; The values below may be out of date.</div>
 <div class="card"><h2>Relays</h2><div id="relays"></div>
-<small>Incoming Art-Net overrides the switches. Amber: the switch waits for the minimum switch time.</small></div>
+<small>Incoming DMX data overrides the switches. Amber: the switch waits for the minimum switch time.</small></div>
 <div class="card"><h2>Status</h2><table>
-<tr><td>Last Art-Net</td><td id="age">-</td></tr>
+<tr><td>Last DMX data</td><td id="age">-</td></tr>
 <tr><td>Packets received</td><td id="packets">-</td></tr>
 <tr><td>ArtPoll (discovery)</td><td id="polls">-</td></tr>
+<tr><td>OSC</td><td id="osc">-</td></tr>
 <tr><td>WiFi</td><td id="wifi">-</td></tr>
 <tr><td>MAC</td><td id="mac">-</td></tr>
-<tr><td colspan="2"><b>Art-Net seen (any universe)</b></td></tr>
+<tr><td colspan="2"><b>DMX sources seen (any universe)</b></td></tr>
 <tbody id="traffic"><tr><td>none yet</td><td></td></tr></tbody>
+<tbody id="announce"></tbody>
 </table></div>
 <div class="card"><h2>Settings</h2><form method="post" action="/save" id="settingsForm">
 %NAMEWARNING%%RENAMEPENDING%
 <label>Device name</label><input name="name" value="%NAME%" maxlength="31" required>
 <small>Must be changed from "artswitch" before saving or restarting. Use a name that is unique on
 the network: the web address becomes http://name.local. Letters, digits and "-". Applied after restart.</small>
+<label>Protocol</label><select name="proto">%PROTOOPTIONS%</select>
 <label>Art-Net universe (port-address 0-32767)</label><input name="universe" type="number" min="0" max="32767" value="%UNIVERSE%">
 <small>0 = Net 0, Sub-Net 0, Universe 0. Some software (e.g. QLC+) calls this "universe 1".</small>
+<label>sACN universe (1-63999)</label><input name="sacnuni" type="number" min="1" max="63999" value="%SACNUNIVERSE%">
+<small>Used when the protocol includes sACN. The board receives multicast (239.255.x.x) and unicast sACN.
+With "Art-Net and sACN" the most recent packet sets the relays.</small>
 <label>DMX base address (1-510)</label><input name="channel" type="number" min="1" max="510" value="%CHANNEL%">
 <small>Relay 1 = base, relay 2 = base+1, relay 3 = base+2.</small>
 %RELAYSETTINGS%
@@ -858,6 +1178,13 @@ still takes over; after that the address is held until the cable is re-plugged. 
 MAC, so the router gives it the same IP) and goes back to Ethernet when the cable returns. If the network can't be joined within 30 s,
 or none is set, the board opens an open WiFi hotspot named "%RUNNINGNAME%"; connect to it and open
 http://192.168.4.1. Leave the password empty to keep the saved one. Applied immediately.</small>
+<label class="chk"><input type="checkbox" name="osc" value="1"%OSCCHECKED%> Accept OSC</label>
+<label>OSC port</label><input name="oscport" type="number" min="1" max="65535" value="%OSCPORT%">
+<label>OSC feedback to (IP:port)</label><input name="oscfb" value="%OSCFB%" placeholder="none, e.g. 192.168.1.20:9000">
+<small>Send <b>/%RUNNINGNAME%/relay/1</b> (to 3) to switch this board, or <b>/artswitch/relay/1</b> to switch every board
+that listens on the port. Value 1 or 0, true or false, or a fader from 0 to 1 (uses the switch points above).
+The latest command wins, so incoming DMX that crosses a switch point overrides OSC. With a feedback address,
+every change of a relay is sent there as /%RUNNINGNAME%/relay/n 1 or 0. Applied immediately.</small>
 <br><button type="submit">Save</button><button type="button" class="off" onclick="restart()">Restart</button>
 </form></div>
 <script>
@@ -879,6 +1206,8 @@ trk.style.background='linear-gradient(to right,#a1a1aa '+p+'%,#f59e0b '+p+'%,#f5
 lab.querySelector('.vo').textContent=pct(a);lab.querySelector('.vn').textContent=pct(b)}
 lo.addEventListener('input',upd);hi.addEventListener('input',upd);upd()});
 // WiFi scan: start it, then ask until the list is ready (it waits for a join attempt in progress)
+// Source names come from the network: show them as text, never as HTML
+const esc=t=>t.replace(/[&<>"]/g,c=>'&#'+c.charCodeAt(0)+';');
 const getJson=async u=>(await fetch(u,{cache:'no-store'})).json();
 async function scan(){scanBtn.disabled=true;scanBtn.textContent='Scanning…';nets.innerHTML='';
 try{let s=await getJson('/scan?start=1');
@@ -938,9 +1267,11 @@ function show(s){showRelays(s);
 age.textContent=s.age<0?'never':(s.age/1000).toFixed(1)+' s ago';
 packets.textContent=s.packets;hip.textContent=s.ip;
 polls.textContent=s.polls?s.polls+'×, last from '+s.pollFrom+' '+(s.pollAge/1000).toFixed(0)+' s ago':'none yet';hmode.textContent=s.net;
-huni.textContent='Universe '+s.universe;hdmx.textContent='DMX '+s.base+'–'+(s.base+s.relays.length-1);mac.textContent=s.mac;
+huni.textContent=s.uniText;hdmx.textContent='DMX '+s.base+'–'+(s.base+s.relays.length-1);mac.textContent=s.mac;
 wifi.textContent=s.wifi;
-if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; universe '+t.u+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('')}
+osc.textContent=s.oscPort?'port '+s.oscPort+', '+(s.oscMsgs?s.oscMsgs+'×, last from '+s.oscFrom+' '+(s.oscAge/1000).toFixed(0)+' s ago':'nothing yet'):'off';
+if(s.traffic.length)traffic.innerHTML=s.traffic.map(t=>'<tr><td>'+t.ip+' &rarr; '+(t.s?'sACN':'Art-Net')+' universe '+t.u+(t.s?'<br><small>'+esc(t.n||'unnamed')+', priority '+t.p+'</small>':'')+'</td><td>'+(t.age/1000).toFixed(1)+' s ago</td></tr>').join('');
+announce.innerHTML=s.announce.length?'<tr><td colspan="2"><b>sACN universes announced</b></td></tr>'+s.announce.map(a=>'<tr><td>'+esc(a.n||'unnamed')+' ('+a.ip+')<br><small>'+(a.u.length+a.more>1?'universes ':'universe ')+a.u.join(', ')+(a.more?' and '+a.more+' more':'')+'</small></td><td>'+(a.age/1000).toFixed(0)+' s ago</td></tr>').join(''):''}
 poll();
 </script></body></html>)html";
 
@@ -970,9 +1301,24 @@ String renderRelaySettings() {
   return html;
 }
 
+// Header line: the universe(s) the board listens to
+String universeText() {
+  String artnet = "Art-Net " + String(settings.universe), sacn = "sACN " + String(settings.sacnUniverse);
+  if (settings.protocol == PROTO_ARTNET) return artnet;
+  if (settings.protocol == PROTO_SACN) return sacn;
+  return artnet + " / " + sacn;
+}
+
 String renderPage() {
   String page = FPSTR(PAGE);
+  page.replace("%UNIVERSETEXT%", universeText());
   page.replace("%UNIVERSE%", String(settings.universe));
+  page.replace("%SACNUNIVERSE%", String(settings.sacnUniverse));
+  String protoOptions;
+  for (int i = PROTO_ARTNET; i <= PROTO_BOTH; i++)
+    protoOptions += "<option value=\"" + String(i) + "\"" + (settings.protocol == i ? " selected" : "") + ">" +
+                    PROTOCOL_NAMES[i] + "</option>";
+  page.replace("%PROTOOPTIONS%", protoOptions);
   page.replace("%CHANNEL%", String(settings.baseChannel));
   page.replace("%RELAYSETTINGS%", renderRelaySettings());
   page.replace("%NAMEWARNING%", settings.name == DEFAULT_NAME
@@ -990,6 +1336,11 @@ String renderPage() {
   page.replace("%DMXRANGE%", String(settings.baseChannel) + "&ndash;" + String(settings.baseChannel + RELAY_COUNT - 1));
   page.replace("%IPMODE%", netModeText());
   page.replace("%NAME%", settings.name);
+  page.replace("%OSCCHECKED%", settings.oscEnabled ? " checked" : "");
+  page.replace("%OSCPORT%", String(settings.oscPort));
+  page.replace("%OSCFB%", (uint32_t)settings.oscFeedbackIp
+                              ? settings.oscFeedbackIp.toString() + ":" + String(settings.oscFeedbackPort)
+                              : String());
   page.replace("%WIFIPASSHINT%", settings.wifiPass.length() ? "saved, leave empty to keep" : "none (open network)");
   page.replace("%WIFISSID%", htmlEscape(settings.wifiSsid));  // last: an SSID may contain anything
   page.replace("%FALLBACK%", (uint32_t)settings.fallbackIp ? settings.fallbackIp.toString() : String());
@@ -998,7 +1349,7 @@ String renderPage() {
 }
 
 String renderStatus() {
-  char json[2048];
+  static char json[3072];  // static: too big for the web server task's stack; requests run one at a time
   size_t n = snprintf(json, sizeof(json), "{\"relays\":[");
   // Keeps n inside the buffer if a long WiFi name ever fills it, so the output is cut, not overrun
   auto clamp = [&]() { n = min(n, sizeof(json) - 1); };
@@ -1014,20 +1365,37 @@ String renderStatus() {
   }
   clamp();
   n += snprintf(json + n, sizeof(json) - n,
-                "],\"universe\":%u,\"base\":%u,\"polls\":%lu,\"pollFrom\":\"%s\",\"pollAge\":%lu,"
+                "],\"universe\":%u,\"uniText\":\"%s\",\"base\":%u,\"polls\":%lu,\"pollFrom\":\"%s\",\"pollAge\":%lu,"
                 "\"age\":%ld,\"packets\":%lu,\"ip\":\"%s\",\"net\":\"%s\",\"mac\":\"%s\",\"wifi\":\"%s\","
+                "\"oscPort\":%u,\"oscMsgs\":%lu,\"oscFrom\":\"%s\",\"oscAge\":%lu,"
                 "\"traffic\":[",
-                settings.universe, settings.baseChannel, (unsigned long)pollReplies,
+                settings.universe, universeText().c_str(), settings.baseChannel, (unsigned long)pollReplies,
                 IPAddress(lastPollFrom).toString().c_str(), (unsigned long)(millis() - lastPollAt),
                 dmxPackets == 0 ? -1L : (long)(millis() - lastDmxAt), (unsigned long)dmxPackets,
                 currentIp().toString().c_str(), netModeText().c_str(), ETH.macAddress().c_str(),
-                jsonEscape(wifiText()).c_str());
+                jsonEscape(wifiText()).c_str(), oscOpenPort, (unsigned long)oscMessages,
+                IPAddress(lastOscFrom).toString().c_str(), (unsigned long)(millis() - lastOscAt));
   uint32_t now = millis();
   for (int i = 0; i < trafficCount; i++) {
     clamp();
-    n += snprintf(json + n, sizeof(json) - n, "%s{\"ip\":\"%s\",\"u\":%u,\"age\":%lu}", i ? "," : "",
-                  IPAddress(traffic[i].ip).toString().c_str(), traffic[i].universe,
+    n += snprintf(json + n, sizeof(json) - n, "%s{\"ip\":\"%s\",\"u\":%u,\"s\":%d,\"n\":\"%s\",\"p\":%u,\"age\":%lu}", i ? "," : "",
+                  IPAddress(traffic[i].ip).toString().c_str(), traffic[i].universe, traffic[i].sacn,
+                  jsonEscape(traffic[i].name).c_str(), traffic[i].priority,
                   (unsigned long)(now - traffic[i].lastAt));
+  }
+  clamp();
+  n += snprintf(json + n, sizeof(json) - n, "],\"announce\":[");
+  bool first = true;
+  for (int i = 0; i < announceCount; i++) {
+    const SacnAnnounce &a = announces[i];
+    if (now - a.lastAt > SACN_ANNOUNCE_TIMEOUT_MS) continue;
+    String list;
+    for (int u = 0; u < min((int)a.count, 16); u++) list += String(u ? "," : "") + a.universes[u];
+    clamp();
+    n += snprintf(json + n, sizeof(json) - n, "%s{\"ip\":\"%s\",\"n\":\"%s\",\"u\":[%s],\"more\":%d,\"age\":%lu}",
+                  first ? "" : ",", IPAddress(a.ip).toString().c_str(), jsonEscape(a.name).c_str(), list.c_str(),
+                  max(0, a.count - 16), (unsigned long)(now - a.lastAt));
+    first = false;
   }
   clamp();
   snprintf(json + n, sizeof(json) - n, "]}");
@@ -1040,6 +1408,8 @@ void handleSave(AsyncWebServerRequest *request) {
     return p ? p->value() : String();
   };
   long universe = arg("universe").toInt();
+  long sacnUniverse = arg("sacnuni").length() ? arg("sacnuni").toInt() : 1;
+  long protocol = arg("proto").toInt();
   long channel = arg("channel").toInt();
   IPAddress fallback;
   String name = sanitizeName(arg("name"));
@@ -1049,16 +1419,33 @@ void handleSave(AsyncWebServerRequest *request) {
   // An empty password field keeps the saved password, unless the network changes
   if (!wifiPass.length() && wifiSsid == settings.wifiSsid) wifiPass = settings.wifiPass;
   if (!wifiSsid.length()) wifiPass = "";
+  bool oscEnabled = arg("osc") == "1";
+  long oscPort = arg("oscport").length() ? arg("oscport").toInt() : 8000;
+  String oscFb = arg("oscfb");
+  oscFb.trim();
+  IPAddress oscFbIp;
+  long oscFbPort = 9000;
+  bool oscFbValid = true;
+  if (oscFb.length()) {
+    int colon = oscFb.indexOf(':');
+    oscFbValid = colon > 0 && oscFbIp.fromString(oscFb.substring(0, colon));
+    oscFbPort = colon > 0 ? oscFb.substring(colon + 1).toInt() : 0;
+  }
   String error;
   if (settingsPending) error = "Previous save still being applied, try again.";
   else if (name == DEFAULT_NAME) error = "Give this board its own name first, not \"artswitch\".";
   else if (universe < 0 || universe > 32767) error = "Universe must be 0-32767.";
+  else if (sacnUniverse < 1 || sacnUniverse > SACN_MAX_UNIVERSE) error = "sACN universe must be 1-63999.";
+  else if (protocol < PROTO_ARTNET || protocol > PROTO_BOTH) error = "Unknown protocol.";
   else if (channel < 1 || channel > 512 - RELAY_COUNT + 1) error = "Base address must be 1-510.";
   else if (arg("fallback").length() && !fallback.fromString(arg("fallback")))
     error = "Fallback IP is not a valid address.";
   else if (wifiSsid.length() > 32) error = "WiFi network name is longer than 32 characters.";
   else if (wifiPass.length() && (wifiPass.length() < 8 || wifiPass.length() > 63))
     error = "WiFi password must be 8-63 characters, or empty for an open network.";
+  else if (oscPort < 1 || oscPort > 65535) error = "OSC port must be 1-65535.";
+  else if (!oscFbValid || oscFbPort < 1 || oscFbPort > 65535)
+    error = "OSC feedback must be an IP address and port, like 192.168.1.20:9000, or empty.";
 
   RelayConfig relayConfig[RELAY_COUNT];
   for (int i = 0; i < RELAY_COUNT && !error.length(); i++) {
@@ -1086,13 +1473,19 @@ void handleSave(AsyncWebServerRequest *request) {
     return;
   }
 
+  pendingSettings.protocol = protocol;
   pendingSettings.universe = universe;
+  pendingSettings.sacnUniverse = sacnUniverse;
   pendingSettings.baseChannel = channel;
   memcpy(pendingSettings.relay, relayConfig, sizeof(relayConfig));
   pendingSettings.name = name;
   pendingSettings.fallbackIp = fallback;
   pendingSettings.wifiSsid = wifiSsid;
   pendingSettings.wifiPass = wifiPass;
+  pendingSettings.oscEnabled = oscEnabled;
+  pendingSettings.oscPort = oscPort;
+  pendingSettings.oscFeedbackIp = oscFbIp;
+  pendingSettings.oscFeedbackPort = oscFbPort;
   settingsPending = true;
   request->redirect("/?saved=1");
 }
@@ -1175,7 +1568,7 @@ void applyPendingSettings() {
     relays[i].value = -1;
   }
   settingsPending = false;
-  Serial.printf("Saved: universe %u, base channel %u, name %s, fallback %s\n", settings.universe,
+  Serial.printf("Saved: %s, base channel %u, name %s, fallback %s\n", universeText().c_str(),
                 settings.baseChannel, settings.name.c_str(), settings.fallbackIp.toString().c_str());
   for (int i = 0; i < RELAY_COUNT; i++) {
     const RelayConfig &c = settings.relay[i];
@@ -1214,6 +1607,10 @@ void loop() {
   updateScan();
   startNetworkServicesOnce();
   handleArtnet();
+  updateSacnSocket();
+  handleSacn();
+  updateOscSocket();
+  handleOsc();
   applyPendingSettings();
   applyPendingTests();
   for (int i = 0; i < RELAY_COUNT; i++) updateRelay(i);  // carry out switches held back by min time

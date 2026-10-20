@@ -1,11 +1,13 @@
 # ArtSwitch
 
-Art-Net controlled relay switch on a **WT32-ETH01** (ESP32 + Ethernet) board. Up to three relays, each switched by one DMX channel, configured from a web page in your browser.
+Art-Net, sACN and OSC controlled relay switch on a **WT32-ETH01** (ESP32 + Ethernet) board. Up to three relays, each switched by one DMX channel, configured from a web page in your browser.
 
 - Up to 3 relays on consecutive DMX channels from a base address
 - Relay pins chosen on the web page — no reflashing
 - DHCP, with a self-assigned `169.254.x.x` fallback when there is no DHCP server
 - Reachable by name: `http://<name>.local`
+- Art-Net, sACN (E1.31) or both, selectable per board
+- OSC control, with relay state feedback
 - Shows up in Art-Net tools (MadMapper, QLC+, DMX-Workshop) via ArtPoll
 - WiFi backup while the Ethernet cable is unplugged, with an open setup hotspot as last resort
 - Firmware updates over Ethernet
@@ -44,7 +46,7 @@ The dead zone stops a relay from chattering when a fader sits near a switch poin
 
 - **Relay 1** listens on the base address, **relay 2** on base + 1, **relay 3** on base + 2.
 - At power-up all relays are **off**.
-- When Art-Net stops (controller off, cable pulled), relays **hold their last state**.
+- When DMX data stops (controller off, cable pulled), relays **hold their last state**.
 - Outputs are **active-high**: the pin goes to 3.3 V when the relay is on.
 
 ---
@@ -65,6 +67,10 @@ A GPIO pin gives 3.3 V at a few milliamps — **not** enough to drive a relay co
 - a **transistor + flyback diode** per relay.
 
 Connect the relay's input to one of the pins below, and its ground to the board's GND.
+
+The prototype uses small **5 V relay modules** whose relays are rated **10 A at 250 VAC / 10 A at 30 VDC**. That is the rating of the relay itself; the module's PCB traces and screw terminals usually can't carry that continuously, so plan for about half. Each coil draws roughly 70 mA from the 5 V supply.
+
+> **Mains:** cheap relay modules have little spacing between the switched side and the 5 V side. If a relay switches mains voltage, use proper insulation and strain relief, keep mains wiring away from the low-voltage side, and have it checked by someone qualified.
 
 ### Which pins to use
 
@@ -113,11 +119,13 @@ Clicked **Later**? Everything else works, but **settings can't be saved and the 
 
 Names use letters, digits and `-` (not at the start or end); capitals become lowercase. To rename a board later, change the name in Settings, Save, and accept the restart.
 
-### 4. Set the Art-Net address
+### 4. Set the protocol and address
 
 | Setting | Meaning |
 |---|---|
+| **Protocol** | **Art-Net** (default), **sACN**, or **Art-Net and sACN**. With both, the most recent packet sets the relays. |
 | **Art-Net universe** | 15-bit port-address, 0–32767. Universe 0 is what some software (e.g. QLC+) calls "universe 1". In MadMapper the numbers match: universe 10 in MadMapper = 10 here. |
+| **sACN universe** | 1–63999, used when the protocol includes sACN. Set separately from the Art-Net universe, because controllers differ in how they map one to the other. |
 | **DMX base address** | Channel for relay 1. Relays 2 and 3 use the next two channels. |
 | **Relay 1/2/3 pin** | Which pin each relay is wired to, or **Not used**. |
 | **Switch points** | Two-handle slider: left handle = off, right handle = on. Grey = off zone, amber = dead zone, green = on zone. Values shown as DMX value and percent. The handles can't cross. |
@@ -127,22 +135,22 @@ Universe, base address, pins, switch points and minimum switch time take effect 
 
 ### 5. Test
 
-The **Relays** card has a slide switch per relay (green = on). Incoming Art-Net overrides it straight away — to test by hand, stop your controller's output first.
+The **Relays** card has a slide switch per relay (green = on). Incoming DMX data overrides it straight away — to test by hand, stop your controller's output first.
 
 ---
 
 ## The web page
 
-**Header** — the board's name, IP address and how it is connected (Ethernet, Ethernet with fallback IP, WiFi, hotspot), Art-Net universe and DMX channels, and its `http://<name>.local` address. Updates live, e.g. right after you save a new universe. The browser tab is titled with the board's name too.
+**Header** — the board's name, IP address and how it is connected (Ethernet, Ethernet with fallback IP, WiFi, hotspot), protocol and universe, DMX channels, and its `http://<name>.local` address. Updates live, e.g. right after you save a new universe. The browser tab is titled with the board's name too.
 
 **Relays** — state of each relay, its pin, channel, switch points and minimum switch time, the last DMX value received, a countdown when a switch is being held back, and a switch to test it by hand.
 
 **Status**
-- *Last Art-Net* / *Packets received* — data for this board's universe and channels.
+- *Last DMX data* / *Packets received* — data for this board's universe and channels.
 - *ArtPoll (discovery)* — how many discovery requests arrived from controllers such as MadMapper, and from where.
 - *WiFi* — standby, joining, joined (with signal strength) or hotspot. See [WiFi backup](#wifi-backup).
 - *MAC* — the board's MAC address, used on Ethernet and on WiFi.
-- *Art-Net seen (any universe)* — every source and universe that reaches the board, matching or not. **First place to look when a relay doesn't respond**: it tells you whether data arrives at all, and on which universe.
+- *DMX sources seen (any universe)* — every Art-Net and sACN source and universe that reaches the board, matching or not. **First place to look when a relay doesn't respond**: it tells you whether data arrives at all, and on which universe.
 
 **Settings** — name, universe, base address, per relay its pin, switch points and minimum switch time, the fallback IP and the backup WiFi network. **Restart** applies name and fallback IP changes; after a restart the page follows the board to its (new) address.
 
@@ -173,7 +181,7 @@ The board normally runs on Ethernet only; its WiFi is off. When the **Ethernet c
 Only one connection is active at a time, so a controller never sees the board twice. Things to know:
 
 - On WiFi the board uses its **Ethernet MAC address**, so your router gives it the **same IP address** as on the cable, and an address reservation in the router covers both. Network switches take a moment to notice the address moved. (On the hotspot, or when the cable had no DHCP server, the address does differ.)
-- Art-Net over WiFi works, but WiFi is less dependable than a cable — treat it as a backup, not for the show.
+- Art-Net and sACN over WiFi work, but WiFi is less dependable than a cable — treat it as a backup, not for the show.
 - The hotspot has **no password**: anyone nearby can open the settings page while it is up.
 - WiFi draws noticeably more current than Ethernet. A weak 5 V supply that copes on Ethernet can make the board restart once WiFi switches on.
 
@@ -195,12 +203,40 @@ Give every board its own name (enforced — see first-time setup) and, usually, 
 
 ---
 
+## sACN
+
+Set *Protocol* to **sACN** (or **Art-Net and sACN**) and enter the *sACN universe*. The board receives sACN both as **multicast** (the controller sends to 239.255.x.x for that universe) and as **unicast** to the board's IP address.
+
+- Several sources on the same universe: the board follows the one with the **highest priority**, as long as it keeps sending. A source that stops for 2.5 seconds, or signals that it has stopped, is dropped and the next one takes over. With equal priorities the most recent packet wins.
+- **Preview** data (sent by some consoles for visualisers) is ignored.
+- *DMX sources seen* shows each sACN source's **name and priority** (MadMapper calls itself "MAD").
+- Sources that support **Universe Discovery** announce which universes they send. The Status card lists them under *sACN universes announced*, which helps when you don't know which universe a controller uses. MadMapper doesn't send these announcements.
+- On **sACN only**, the board doesn't answer Art-Net discovery (ArtPoll), so controllers won't list it as an Art-Net device. It does still list incoming Art-Net under *DMX sources seen*.
+- Some network switches and WiFi access points block or slow down multicast. If multicast sACN doesn't arrive, set the controller to unicast to the board's IP.
+
+## OSC
+
+Tick **Accept OSC** in Settings and set the port (default 8000). The board listens on Ethernet and WiFi.
+
+| Address | Switches |
+|---|---|
+| `/<name>/relay/1` … `/<name>/relay/3` | that relay on this board, e.g. `/stage-left/relay/2` |
+| `/artswitch/relay/1` … `/artswitch/relay/3` | that relay on **every** board listening on the port (send to the broadcast address) |
+
+The value can be an integer (0 = off, anything else = on), `true` / `false`, or a float or double from 0 to 1. A float goes through the relay's switch points like a DMX value (0–1 becomes 0–255), so a fader parked near the middle doesn't make the relay chatter. OSC bundles are accepted.
+
+OSC works like the switches on the web page: the latest command wins. If Art-Net or sACN keeps sending a value on the other side of a switch point, the relay follows the DMX data again with the next packet.
+
+**Feedback:** enter an *OSC feedback to* address such as `192.168.1.20:9000`, and every change of a relay output, whether caused by OSC, DMX or the web page, is sent there as `/<name>/relay/<n>` with integer 1 or 0. Buttons in TouchOSC, QLab or similar then show the real relay state. Feedback is sent from the board's OSC port.
+
+The Status card shows how many OSC messages arrived and from where.
+
 ## Using it with MadMapper
 
 1. **Preferences → Project → DMX**: set *DMX Output Device* to **ArtNet** and *Interface* to the network adapter the boards are on.
 2. Add a DMX fixture on the universe and channel(s) set on the board.
 3. Make sure the fixture is **switched on** in MadMapper — a disabled fixture sends nothing.
-4. Check the board's web page: *Art-Net seen* should show your PC's IP and the universe.
+4. Check the board's web page: *DMX sources seen* should show your PC's IP and the universe.
 
 **Broadcast or unicast.** With *Use Unicast* off (the default), MadMapper broadcasts every universe to the whole network and each board picks out its own — no device list needed. With **Use Unicast** on and **Auto Poll for devices** ticked, MadMapper discovers the boards and lists them with IP, status, name and universe; it then sends each universe only to the boards that use it, which keeps a busy network quieter. The board's *ArtPoll (discovery)* line on the Status card shows whether MadMapper's discovery requests arrive.
 
@@ -257,9 +293,9 @@ ArtSwitch is meant for closed show and lighting networks. There is **no login on
 
 ## Troubleshooting
 
-**Relay doesn't respond to Art-Net**
-1. Open the web page, look at *Art-Net seen*.
-2. Nothing listed → no data reaches the board. Check the controller's output is on (in MadMapper: the fixture is switched on), it sends to the board's IP or to the network's broadcast address, and it uses Art-Net, not sACN.
+**Relay doesn't respond to Art-Net or sACN**
+1. Open the web page, look at *DMX sources seen*.
+2. Nothing listed → no data reaches the board. Check the controller's output is on (in MadMapper: the fixture is switched on), it sends to the board's IP or to the network's broadcast address, and the board's *Protocol* setting includes the protocol it sends.
 3. Listed, but another universe → set the matching universe on the board or the controller.
 4. Right universe, relay still doesn't follow → check the base address, that the relay has a pin assigned, and its switch points: a value inside the dead zone doesn't change the relay.
 5. Relay follows, but late → its minimum switch time is holding it back (countdown on the relay card).
